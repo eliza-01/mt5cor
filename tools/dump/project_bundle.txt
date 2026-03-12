@@ -2311,7 +2311,6 @@ PAIR_2_UP = "#60a5fa"
 PAIR_2_DOWN = "#f59e0b"
 
 # src/app/ui_relative_compare/models.py
-
 # src/app/ui_relative_compare/models.py
 # Dataclasses for metrics, render snapshot, divergence stats, and trade plan.
 from __future__ import annotations
@@ -2355,6 +2354,7 @@ class RenderSnapshot:
     bars: pd.DataFrame
     metrics: RelativeMetrics
     divergence_stats: DivergenceStats
+    divergence_series: pd.Series
     trade_plan: TradePlan
     digits_1: int
     digits_2: int
@@ -2365,7 +2365,6 @@ class RenderSnapshot:
 # Service layer for relative compare.
 
 # src/app/ui_relative_compare/services/market.py
-
 # src/app/ui_relative_compare/services/market.py
 # Loads symbol history, computes relative metrics, divergence stats, and prepares render/trade state.
 from __future__ import annotations
@@ -2456,6 +2455,35 @@ def calculate_relative_metrics(
     )
 
 
+def aggregate_pair_frame(frame: pd.DataFrame, bars_per_candle: int) -> pd.DataFrame:
+    if bars_per_candle <= 1:
+        return frame.copy().reset_index(drop=True)
+
+    grouped = frame.copy()
+    grouped["_group"] = pd.Series(range(len(grouped)), index=grouped.index) // bars_per_candle
+
+    aggregated = (
+        grouped.groupby("_group", sort=True)
+        .agg(
+            {
+                "time": "last",
+                "open_1": "first",
+                "high_1": "max",
+                "low_1": "min",
+                "close_1": "last",
+                "tick_volume_1": "sum",
+                "open_2": "first",
+                "high_2": "max",
+                "low_2": "min",
+                "close_2": "last",
+                "tick_volume_2": "sum",
+            }
+        )
+        .reset_index(drop=True)
+    )
+    return aggregated
+
+
 def build_relative_bars(
     frame: pd.DataFrame,
     digits_1: int,
@@ -2498,7 +2526,7 @@ def build_relative_bars(
     ].reset_index(drop=True)
 
 
-def calculate_divergence_stats(
+def _build_divergence_series(
     frame: pd.DataFrame,
     digits_1: int,
     digits_2: int,
@@ -2506,7 +2534,7 @@ def calculate_divergence_stats(
     use_ratio_in_divergence: bool,
     bid_1: float | None = None,
     bid_2: float | None = None,
-) -> DivergenceStats:
+) -> tuple[pd.Series, DivergenceStats]:
     pip_1 = pip_size_from_digits(digits_1)
     pip_2 = pip_size_from_digits(digits_2)
     factor = ratio_1_to_2 if use_ratio_in_divergence else 1.0
@@ -2514,20 +2542,24 @@ def calculate_divergence_stats(
     diff_series = (
         ((frame["close_1"] - frame["open_1"]) / pip_1)
         - (((frame["close_2"] - frame["open_2"]) / pip_2) * factor)
-    )
+    ).astype(float)
 
-    total_diff_pips = float(diff_series.sum())
     current_bar_diff_pips = float(diff_series.iloc[-1])
-
     live_diff_pips = current_bar_diff_pips
+
+    render_series = diff_series.copy()
+
     if bid_1 is not None and bid_2 is not None:
         last = frame.iloc[-1]
         live_diff_pips = float(
             ((float(bid_1) - float(last["open_1"])) / pip_1)
             - ((((float(bid_2) - float(last["open_2"])) / pip_2) * factor))
         )
+        render_series.iloc[-1] = live_diff_pips
 
-    return DivergenceStats(
+    total_diff_pips = float(render_series.sum())
+
+    return render_series.reset_index(drop=True), DivergenceStats(
         total_diff_pips=total_diff_pips,
         current_bar_diff_pips=current_bar_diff_pips,
         live_diff_pips=live_diff_pips,
@@ -2602,16 +2634,19 @@ def build_render_snapshot(
     bars_count: int,
     ratio_1_to_2: float,
     use_ratio_in_divergence: bool,
+    bars_per_candle: int,
 ) -> RenderSnapshot:
-    frame, meta_1, meta_2 = load_two_symbols(client, symbol_1, symbol_2, timeframe, bars_count)
-    metrics = calculate_relative_metrics(frame, meta_1.digits, meta_2.digits, timeframe)
-    bars = build_relative_bars(frame, meta_1.digits, meta_2.digits, ratio_1_to_2)
+    raw_frame, meta_1, meta_2 = load_two_symbols(client, symbol_1, symbol_2, timeframe, bars_count)
+    metrics = calculate_relative_metrics(raw_frame, meta_1.digits, meta_2.digits, timeframe)
+
+    render_frame = aggregate_pair_frame(raw_frame, bars_per_candle)
+    bars = build_relative_bars(render_frame, meta_1.digits, meta_2.digits, ratio_1_to_2)
 
     tick_1 = client.tick(symbol_1)
     tick_2 = client.tick(symbol_2)
 
-    divergence_stats = calculate_divergence_stats(
-        frame=frame,
+    divergence_series, divergence_stats = _build_divergence_series(
+        frame=render_frame,
         digits_1=meta_1.digits,
         digits_2=meta_2.digits,
         ratio_1_to_2=ratio_1_to_2,
@@ -2625,6 +2660,7 @@ def build_render_snapshot(
         bars=bars,
         metrics=metrics,
         divergence_stats=divergence_stats,
+        divergence_series=divergence_series,
         trade_plan=trade_plan,
         digits_1=meta_1.digits,
         digits_2=meta_2.digits,
@@ -2949,7 +2985,7 @@ def close_pair_positions(
 
 # src/app/ui_relative_compare/ui/app.py
 # src/app/ui_relative_compare/ui/app.py
-# Tk application for non-mirrored relative candles, divergence mode checkbox,
+# Tk application for scrollable fixed-size relative candles, divergence mode checkbox,
 # close-by-pair with PnL, and opposite-position opening.
 from __future__ import annotations
 
@@ -2973,8 +3009,8 @@ class RelativeCompareUI(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("MT5 Relative Compare")
-        self.geometry("1360x900")
-        self.minsize(1220, 800)
+        self.geometry("1380x980")
+        self.minsize(1240, 860)
 
         self.base_cfg = load_settings()
         self.client: MT5Client | None = None
@@ -2984,9 +3020,11 @@ class RelativeCompareUI(tk.Tk):
         self.symbol_1_var = tk.StringVar(value="EURUSD")
         self.symbol_2_var = tk.StringVar(value="AUDUSD")
         self.timeframe_var = tk.StringVar(value="M1")
-        self.calc_bars_var = tk.StringVar(value="240")
-        self.visible_bars_var = tk.StringVar(value="40")
-        self.refresh_ms_var = tk.StringVar(value="1000")
+        self.calc_bars_var = tk.StringVar(value="1440")
+        self.visible_bars_var = tk.StringVar(value="120")
+        self.refresh_ms_var = tk.StringVar(value="250")
+        self.aggregate_bars_var = tk.StringVar(value="1")
+        self.aggregate_info_var = tk.StringVar(value="M1 x 1")
         self.use_ratio_in_divergence_var = tk.BooleanVar(value=False)
 
         self.status_var = tk.StringVar(value="idle")
@@ -3036,7 +3074,7 @@ class RelativeCompareUI(tk.Tk):
         ttk.Label(controls, text="Баров для расчёта").grid(row=0, column=6, sticky="w")
         ttk.Entry(controls, textvariable=self.calc_bars_var, width=8).grid(row=0, column=7, padx=(6, 14), sticky="w")
 
-        ttk.Label(controls, text="Видимых свечей").grid(row=0, column=8, sticky="w")
+        ttk.Label(controls, text="Баров в ленте").grid(row=0, column=8, sticky="w")
         ttk.Entry(controls, textvariable=self.visible_bars_var, width=8).grid(row=0, column=9, padx=(6, 14), sticky="w")
 
         ttk.Label(controls, text="Refresh ms").grid(row=0, column=10, sticky="w")
@@ -3055,7 +3093,7 @@ class RelativeCompareUI(tk.Tk):
         ttk.Button(controls, text="Стоп", command=self.stop_live).grid(row=1, column=6, pady=(10, 0), sticky="w")
         ttk.Button(controls, text="Разовый рендер", command=self.render_once).grid(row=1, column=7, pady=(10, 0), sticky="w")
 
-        sizing = ttk.LabelFrame(root, text="Общий размер свечей", padding=10)
+        sizing = ttk.LabelFrame(root, text="Фиксированный размер свечей", padding=10)
         sizing.pack(fill="x", pady=(10, 0))
 
         ttk.Label(sizing, text="Ширина").grid(row=0, column=0, sticky="w")
@@ -3095,23 +3133,117 @@ class RelativeCompareUI(tk.Tk):
         ttk.Label(
             hint,
             text=(
-                "Слева сверху показана легенда цветов по парам. "
-                "На двух последних свечах стрелками показано, какая пара сейчас идёт в SELL и какая в BUY. "
-                "Красная стрелка вниз — SELL, зелёная вверх — BUY."
+                "Свечи фиксированного размера и не ужимаются от количества баров. "
+                "Лента скроллится ползунком, колесом и перетаскиванием мышью. "
+                "Слева есть зона для агрегации: можно собрать несколько баров выбранного timeframe "
+                "в одну общую свечу. Нижняя линия расхождения строится по той же агрегации."
             ),
-            wraplength=1280,
+            wraplength=1300,
         ).pack(anchor="w")
 
         chart_wrap = ttk.LabelFrame(root, text="Сравнение свечей", padding=8)
         chart_wrap.pack(fill="both", expand=True, pady=(10, 0))
 
-        self.canvas = tk.Canvas(chart_wrap, bg="#111111", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
-        self.chart = RelativeChart(self.canvas)
+        chart_layout = ttk.Frame(chart_wrap)
+        chart_layout.pack(fill="both", expand=True)
+
+        self.left_chart_panel = ttk.Frame(chart_layout, width=200)
+        self.left_chart_panel.pack(side="left", fill="y")
+        self.left_chart_panel.pack_propagate(False)
+
+        ttk.Label(self.left_chart_panel, text="Агрегация ленты", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(4, 10))
+        ttk.Label(self.left_chart_panel, text="Баров в 1 свече").pack(anchor="w")
+        ttk.Entry(self.left_chart_panel, textvariable=self.aggregate_bars_var, width=10).pack(anchor="w", pady=(4, 10))
+        ttk.Button(self.left_chart_panel, text="Применить", command=self.render_once).pack(anchor="w", pady=(0, 10))
+        ttk.Label(self.left_chart_panel, text="Текущая сборка").pack(anchor="w")
+        ttk.Label(self.left_chart_panel, textvariable=self.aggregate_info_var).pack(anchor="w", pady=(4, 10))
+        ttk.Label(
+            self.left_chart_panel,
+            text="Итоговая свеча = выбранный timeframe x указанное число баров.",
+            wraplength=180,
+            justify="left",
+        ).pack(anchor="w", pady=(6, 0))
+
+        ttk.Separator(chart_layout, orient="vertical").pack(side="left", fill="y", padx=8)
+
+        charts_right = ttk.Frame(chart_layout)
+        charts_right.pack(side="left", fill="both", expand=True)
+
+        charts_right.columnconfigure(0, weight=1)
+        charts_right.rowconfigure(0, weight=1)
+        charts_right.rowconfigure(1, weight=0)
+        charts_right.rowconfigure(2, weight=0)
+
+        self.candle_canvas = tk.Canvas(charts_right, bg="#111111", highlightthickness=0)
+        self.candle_canvas.grid(row=0, column=0, sticky="nsew")
+
+        self.line_wrap = ttk.Frame(charts_right, height=180)
+        self.line_wrap.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.line_wrap.grid_propagate(False)
+        self.line_wrap.columnconfigure(0, weight=1)
+        self.line_wrap.rowconfigure(0, weight=1)
+
+        self.line_canvas = tk.Canvas(self.line_wrap, bg="#111111", highlightthickness=0, height=180)
+        self.line_canvas.grid(row=0, column=0, sticky="nsew")
+
+        self.h_scroll = ttk.Scrollbar(charts_right, orient="horizontal", command=self._on_scrollbar)
+        self.h_scroll.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+
+        self.candle_canvas.configure(xscrollcommand=self._set_scrollbar)
+        self.line_canvas.configure(xscrollcommand=self._set_scrollbar)
+
+        self.chart = RelativeChart(self.candle_canvas, self.line_canvas)
+        self._bind_scroll_events()
+
+    def _bind_scroll_events(self) -> None:
+        for widget in (self.candle_canvas, self.line_canvas):
+            widget.bind("<MouseWheel>", self._on_mousewheel_horizontal)
+            widget.bind("<Shift-MouseWheel>", self._on_mousewheel_horizontal)
+            widget.bind("<Button-4>", self._on_mousewheel_horizontal)
+            widget.bind("<Button-5>", self._on_mousewheel_horizontal)
+            widget.bind("<ButtonPress-1>", self._on_scan_mark)
+            widget.bind("<B1-Motion>", self._on_scan_drag)
 
     def _kv(self, parent: ttk.Widget, row: int, col: int, key: str, var: tk.StringVar) -> None:
         ttk.Label(parent, text=key).grid(row=row, column=col, sticky="w", padx=(0, 6), pady=4)
         ttk.Label(parent, textvariable=var).grid(row=row, column=col + 1, sticky="w", padx=(0, 18), pady=4)
+
+    def _set_scrollbar(self, first: str, last: str) -> None:
+        self.h_scroll.set(first, last)
+
+    def _on_scrollbar(self, *args) -> None:
+        self.candle_canvas.xview(*args)
+        self.line_canvas.xview(*args)
+
+    def _sync_canvas_view(self, first_fraction: float) -> None:
+        pos = max(0.0, min(1.0, float(first_fraction)))
+        self.candle_canvas.xview_moveto(pos)
+        self.line_canvas.xview_moveto(pos)
+
+    def _on_mousewheel_horizontal(self, event) -> str:
+        if getattr(event, "num", None) == 4:
+            delta_units = -3
+        elif getattr(event, "num", None) == 5:
+            delta_units = 3
+        else:
+            delta = int(getattr(event, "delta", 0) or 0)
+            if delta == 0:
+                return "break"
+            delta_units = -3 if delta > 0 else 3
+
+        self.candle_canvas.xview_scroll(delta_units, "units")
+        self.line_canvas.xview_scroll(delta_units, "units")
+        return "break"
+
+    def _on_scan_mark(self, event) -> str:
+        self.candle_canvas.scan_mark(event.x, 0)
+        self.line_canvas.scan_mark(event.x, 0)
+        return "break"
+
+    def _on_scan_drag(self, event) -> str:
+        self.candle_canvas.scan_dragto(event.x, 0, gain=1)
+        self.line_canvas.scan_dragto(event.x, 0, gain=1)
+        return "break"
 
     def connect_mt5(self) -> None:
         try:
@@ -3134,7 +3266,7 @@ class RelativeCompareUI(tk.Tk):
         if not self.connected or self.client is None:
             raise RuntimeError("MT5 не подключен")
 
-    def _read_inputs(self) -> tuple[str, str, str, int, int, int]:
+    def _read_inputs(self) -> tuple[str, str, str, int, int, int, int]:
         symbol_1 = self.symbol_1_var.get().strip()
         symbol_2 = self.symbol_2_var.get().strip()
         timeframe = self.timeframe_var.get().strip()
@@ -3142,21 +3274,22 @@ class RelativeCompareUI(tk.Tk):
         if timeframe not in TIMEFRAME_MINUTES:
             raise RuntimeError("Неподдерживаемый timeframe")
 
-        calc_bars = max(20, int(self.calc_bars_var.get().strip() or "240"))
-        visible_bars = max(5, int(self.visible_bars_var.get().strip() or "40"))
-        refresh_ms = max(300, int(self.refresh_ms_var.get().strip() or "1000"))
+        calc_bars = max(20, int(self.calc_bars_var.get().strip() or "1440"))
+        visible_bars = max(20, int(self.visible_bars_var.get().strip() or "120"))
+        refresh_ms = max(100, int(self.refresh_ms_var.get().strip() or "250"))
+        aggregate_bars = max(1, int(self.aggregate_bars_var.get().strip() or "1"))
 
         if symbol_1 == symbol_2:
             raise RuntimeError("Нужно выбрать две разные пары")
 
-        return symbol_1, symbol_2, timeframe, calc_bars, visible_bars, refresh_ms
+        return symbol_1, symbol_2, timeframe, calc_bars, visible_bars, refresh_ms, aggregate_bars
 
     def calculate_ratio(self) -> None:
         try:
             self._ensure_connected()
             assert self.client is not None
 
-            symbol_1, symbol_2, timeframe, calc_bars, _, _ = self._read_inputs()
+            symbol_1, symbol_2, timeframe, calc_bars, _, _, _ = self._read_inputs()
             frame, meta_1, meta_2 = load_two_symbols(self.client, symbol_1, symbol_2, timeframe, calc_bars)
             self.relative_metrics = calculate_relative_metrics(frame, meta_1.digits, meta_2.digits, timeframe)
 
@@ -3179,7 +3312,10 @@ class RelativeCompareUI(tk.Tk):
             if self.relative_metrics is None:
                 raise RuntimeError("Сначала нажми 'Рассчитать коэффициент'")
 
-            symbol_1, symbol_2, timeframe, _, visible_bars, _ = self._read_inputs()
+            symbol_1, symbol_2, timeframe, _, visible_bars, _, aggregate_bars = self._read_inputs()
+            prev_x = self.candle_canvas.xview()[0]
+            had_snapshot = self.current_snapshot is not None
+
             snapshot = build_render_snapshot(
                 client=self.client,
                 cfg=self.base_cfg,
@@ -3189,6 +3325,7 @@ class RelativeCompareUI(tk.Tk):
                 bars_count=visible_bars,
                 ratio_1_to_2=self.relative_metrics.ratio_1_to_2,
                 use_ratio_in_divergence=self.use_ratio_in_divergence_var.get(),
+                bars_per_candle=aggregate_bars,
             )
 
             self.current_snapshot = snapshot
@@ -3196,6 +3333,8 @@ class RelativeCompareUI(tk.Tk):
 
             if snapshot.bars.empty:
                 return
+
+            self.aggregate_info_var.set(f"{timeframe} x {aggregate_bars} | {len(snapshot.bars)} свечей")
 
             self.last_bar_time_var.set(str(snapshot.bars.iloc[-1]["time"]))
             self.trade_hint_var.set(
@@ -3208,6 +3347,7 @@ class RelativeCompareUI(tk.Tk):
 
             self.chart.draw(
                 bars=snapshot.bars,
+                divergence_series=snapshot.divergence_series,
                 symbol_1=symbol_1,
                 symbol_2=symbol_2,
                 ratio_1_to_2=self.relative_metrics.ratio_1_to_2,
@@ -3216,6 +3356,14 @@ class RelativeCompareUI(tk.Tk):
                 divergence_stats=snapshot.divergence_stats,
                 trade_plan=snapshot.trade_plan,
             )
+
+            self.update_idletasks()
+
+            if had_snapshot:
+                self._sync_canvas_view(prev_x)
+            else:
+                self._sync_canvas_view(1.0)
+
             self.status_var.set("rendered")
         except Exception as exc:
             self.status_var.set("render_error")
@@ -3272,7 +3420,7 @@ class RelativeCompareUI(tk.Tk):
             self._ensure_connected()
             assert self.client is not None
 
-            symbol_1, symbol_2, _, _, _, _ = self._read_inputs()
+            symbol_1, symbol_2, _, _, _, _, _ = self._read_inputs()
             summary = close_pair_positions(self.client, self.base_cfg, symbol_1, symbol_2)
             self.status_var.set("positions_closed")
             messagebox.showinfo(
@@ -3307,9 +3455,9 @@ class RelativeCompareUI(tk.Tk):
             pass
         finally:
             try:
-                _, _, _, _, _, refresh_ms = self._read_inputs()
+                _, _, _, _, _, refresh_ms, _ = self._read_inputs()
             except Exception:
-                refresh_ms = 1000
+                refresh_ms = 250
             self.live_job = self.after(refresh_ms, self._live_tick)
 
     def stop_live(self) -> None:
@@ -3334,7 +3482,7 @@ def main() -> None:
 
 # src/app/ui_relative_compare/ui/chart.py
 # src/app/ui_relative_compare/ui/chart.py
-# Draws two non-mirrored relative candle streams side by side on one canvas.
+# Draws a fixed-size scrollable candle tape and a synced divergence line chart below it.
 from __future__ import annotations
 
 import tkinter as tk
@@ -3354,11 +3502,44 @@ from src.app.ui_relative_compare.constants import (
 from src.app.ui_relative_compare.models import DivergenceStats, TradePlan
 
 
+BASE_STEP_X = 28.0
+BASE_BODY_HALF = 4.0
+BASE_WICK_OFFSET = 7.0
+
+
 class RelativeChart:
-    def __init__(self, canvas: tk.Canvas) -> None:
-        self.canvas = canvas
+    def __init__(self, candle_canvas: tk.Canvas, line_canvas: tk.Canvas) -> None:
+        self.candle_canvas = candle_canvas
+        self.line_canvas = line_canvas
 
     def draw(
+        self,
+        bars: pd.DataFrame,
+        divergence_series: pd.Series,
+        symbol_1: str,
+        symbol_2: str,
+        ratio_1_to_2: float,
+        width_adjust_px: int,
+        height_adjust_px: int,
+        divergence_stats: DivergenceStats,
+        trade_plan: TradePlan,
+    ) -> None:
+        self._draw_candles(
+            bars=bars,
+            symbol_1=symbol_1,
+            symbol_2=symbol_2,
+            ratio_1_to_2=ratio_1_to_2,
+            width_adjust_px=width_adjust_px,
+            height_adjust_px=height_adjust_px,
+            divergence_stats=divergence_stats,
+            trade_plan=trade_plan,
+        )
+        self._draw_divergence_line(
+            divergence_series=divergence_series,
+            width_adjust_px=width_adjust_px,
+        )
+
+    def _draw_candles(
         self,
         bars: pd.DataFrame,
         symbol_1: str,
@@ -3369,18 +3550,25 @@ class RelativeChart:
         divergence_stats: DivergenceStats,
         trade_plan: TradePlan,
     ) -> None:
-        self.canvas.update_idletasks()
-        width = max(self.canvas.winfo_width(), 400)
-        height = max(self.canvas.winfo_height(), 300)
+        self.candle_canvas.update_idletasks()
+        viewport_width = max(self.candle_canvas.winfo_width(), 400)
+        height = max(self.candle_canvas.winfo_height(), 340)
 
-        self.canvas.delete("all")
-        self.canvas.create_rectangle(0, 0, width, height, fill=CHART_BG, outline=CHART_BG)
+        self.candle_canvas.delete("all")
+        self.candle_canvas.create_rectangle(0, 0, viewport_width, height, fill=CHART_BG, outline=CHART_BG)
 
         center_y = height / 2
         left_pad = 60
-        right_pad = 20
+        right_pad = 30
         top_pad = 118
         bottom_pad = 34
+
+        n = len(bars)
+        step_x = max(16.0, BASE_STEP_X + width_adjust_px)
+        body_half = max(2.0, BASE_BODY_HALF + width_adjust_px * 0.35)
+        wick_offset = max(body_half + 2.0, BASE_WICK_OFFSET + width_adjust_px * 0.35)
+
+        total_width = max(viewport_width, left_pad + right_pad + n * step_x + step_x)
 
         max_abs = 1.0
         for col in ["p1_high", "p1_low", "p1_close", "p2_high", "p2_low", "p2_close"]:
@@ -3388,24 +3576,19 @@ class RelativeChart:
             if pd.notna(val):
                 max_abs = max(max_abs, float(val))
 
-        usable_half = (height - top_pad - bottom_pad) / 2 - 10
+        usable_half = max(40.0, (height - top_pad - bottom_pad) / 2 - 10)
         base_scale = usable_half / (max_abs * 1.15)
         scale = max(0.5, base_scale + height_adjust_px)
 
-        self.canvas.create_line(left_pad, center_y, width - right_pad, center_y, fill=CHART_AXIS, width=1)
-        self.canvas.create_text(12, center_y, anchor="w", text="OPEN", fill=CHART_AXIS, font=("Segoe UI", 9, "bold"))
+        self.candle_canvas.create_line(left_pad, center_y, total_width - right_pad, center_y, fill=CHART_AXIS, width=1)
+        self.candle_canvas.create_text(12, center_y, anchor="w", text="OPEN", fill=CHART_AXIS, font=("Segoe UI", 9, "bold"))
 
         for level in [0.25, 0.5, 0.75, 1.0]:
             dy = max_abs * base_scale * level
-            self.canvas.create_line(left_pad, center_y - dy, width - right_pad, center_y - dy, fill=CHART_GRID)
-            self.canvas.create_line(left_pad, center_y + dy, width - right_pad, center_y + dy, fill=CHART_GRID)
+            self.candle_canvas.create_line(left_pad, center_y - dy, total_width - right_pad, center_y - dy, fill=CHART_GRID)
+            self.candle_canvas.create_line(left_pad, center_y + dy, total_width - right_pad, center_y + dy, fill=CHART_GRID)
 
-        n = len(bars)
-        step_x = max(10, (width - left_pad - right_pad) / max(n, 1))
-        body_half = max(2.0, min(step_x * 0.42, step_x * 0.18 + width_adjust_px))
-        wick_offset = max(body_half + 2.0, min(step_x * 0.46, body_half + 3.0))
-
-        last_points: list[dict[str, float | int]] = []
+        last_points: list[dict[str, float]] = []
 
         for i, row in bars.iterrows():
             x = left_pad + step_x * i + step_x / 2
@@ -3424,16 +3607,15 @@ class RelativeChart:
             p1_x = x - wick_offset
             p2_x = x + wick_offset
 
-            self.canvas.create_line(p1_x, p1_high_y, p1_x, p1_low_y, fill=p1_color, width=1)
-            self.canvas.create_line(p2_x, p2_high_y, p2_x, p2_low_y, fill=p2_color, width=1)
+            self.candle_canvas.create_line(p1_x, p1_high_y, p1_x, p1_low_y, fill=p1_color, width=1)
+            self.candle_canvas.create_line(p2_x, p2_high_y, p2_x, p2_low_y, fill=p2_color, width=1)
 
-            self._draw_body(p1_x, center_y, p1_close_y, body_half, p1_color)
-            self._draw_body(p2_x, center_y, p2_close_y, body_half, p2_color)
+            self._draw_body(self.candle_canvas, p1_x, center_y, p1_close_y, body_half, p1_color)
+            self._draw_body(self.candle_canvas, p2_x, center_y, p2_close_y, body_half, p2_color)
 
             if i >= max(0, n - 2):
                 last_points.append(
                     {
-                        "index": i,
                         "p1_x": p1_x,
                         "p2_x": p2_x,
                         "p1_high_y": p1_high_y,
@@ -3443,13 +3625,13 @@ class RelativeChart:
                     }
                 )
 
-        self.canvas.create_text(
-            width / 2,
+        self.candle_canvas.create_text(
+            total_width / 2,
             10,
             anchor="n",
             fill=CHART_TEXT,
             font=("Segoe UI", 10),
-            text="свечи рядом, без зеркала",
+            text="свечи рядом, фиксированный размер, горизонтальный скролл",
         )
 
         self._draw_pair_legend(symbol_1, symbol_2)
@@ -3461,8 +3643,8 @@ class RelativeChart:
             f"Текущая свеча Δ: {divergence_stats.current_bar_diff_pips:+.2f} п\n"
             f"Live bid Δ: {divergence_stats.live_diff_pips:+.2f} п"
         )
-        self.canvas.create_text(
-            width - right_pad,
+        self.candle_canvas.create_text(
+            total_width - right_pad,
             10,
             anchor="ne",
             fill=CHART_TEXT,
@@ -3479,8 +3661,8 @@ class RelativeChart:
             height=height,
         )
 
-        self.canvas.create_text(
-            width - right_pad,
+        self.candle_canvas.create_text(
+            total_width - right_pad,
             height - 10,
             anchor="se",
             fill=CHART_TEXT,
@@ -3488,13 +3670,69 @@ class RelativeChart:
             text=f"{symbol_2} | scale coef 1/2 = {ratio_1_to_2:.6f} | width={width_adjust_px:+d}px | height={height_adjust_px:+d}px",
         )
 
+        self.candle_canvas.configure(scrollregion=(0, 0, total_width, height))
+
+    def _draw_divergence_line(
+        self,
+        divergence_series: pd.Series,
+        width_adjust_px: int,
+    ) -> None:
+        self.line_canvas.update_idletasks()
+        viewport_width = max(self.line_canvas.winfo_width(), 400)
+        height = max(self.line_canvas.winfo_height(), 120)
+
+        self.line_canvas.delete("all")
+        self.line_canvas.create_rectangle(0, 0, viewport_width, height, fill=CHART_BG, outline=CHART_BG)
+
+        left_pad = 60
+        right_pad = 30
+        top_pad = 18
+        bottom_pad = 22
+
+        n = len(divergence_series)
+        step_x = max(16.0, BASE_STEP_X + width_adjust_px)
+        total_width = max(viewport_width, left_pad + right_pad + n * step_x + step_x)
+
+        max_abs = max(1.0, float(divergence_series.abs().max()) if not divergence_series.empty else 1.0)
+        mid_y = height / 2
+        usable_half = max(20.0, (height - top_pad - bottom_pad) / 2)
+        scale = usable_half / (max_abs * 1.1)
+
+        self.line_canvas.create_line(left_pad, mid_y, total_width - right_pad, mid_y, fill=CHART_AXIS, width=1)
+        self.line_canvas.create_text(12, mid_y, anchor="w", text="0", fill=CHART_AXIS, font=("Segoe UI", 9, "bold"))
+
+        for level in [0.5, 1.0]:
+            dy = max_abs * scale * level
+            self.line_canvas.create_line(left_pad, mid_y - dy, total_width - right_pad, mid_y - dy, fill=CHART_GRID)
+            self.line_canvas.create_line(left_pad, mid_y + dy, total_width - right_pad, mid_y + dy, fill=CHART_GRID)
+
+        points: list[float] = []
+        for i, value in enumerate(divergence_series.tolist()):
+            x = left_pad + step_x * i + step_x / 2
+            y = mid_y - float(value) * scale
+            points.extend([x, y])
+
+        if len(points) >= 4:
+            self.line_canvas.create_line(*points, fill="#eab308", width=2, smooth=False)
+
+        self.line_canvas.create_text(
+            left_pad,
+            6,
+            anchor="nw",
+            fill=CHART_TEXT,
+            font=("Segoe UI", 9, "bold"),
+            text="Линия расхождения",
+        )
+
+        self.line_canvas.configure(scrollregion=(0, 0, total_width, height))
+
     def _draw_pair_legend(self, symbol_1: str, symbol_2: str) -> None:
         x0 = 16
         y0 = 10
         row_h = 22
         box = 10
 
-        self.canvas.create_text(
+        self.candle_canvas.create_text(
             x0,
             y0,
             anchor="nw",
@@ -3504,9 +3742,9 @@ class RelativeChart:
         )
 
         y1 = y0 + 22
-        self.canvas.create_rectangle(x0, y1, x0 + box, y1 + box, fill=PAIR_1_UP, outline=PAIR_1_UP)
-        self.canvas.create_rectangle(x0 + 14, y1, x0 + 14 + box, y1 + box, fill=PAIR_1_DOWN, outline=PAIR_1_DOWN)
-        self.canvas.create_text(
+        self.candle_canvas.create_rectangle(x0, y1, x0 + box, y1 + box, fill=PAIR_1_UP, outline=PAIR_1_UP)
+        self.candle_canvas.create_rectangle(x0 + 14, y1, x0 + 14 + box, y1 + box, fill=PAIR_1_DOWN, outline=PAIR_1_DOWN)
+        self.candle_canvas.create_text(
             x0 + 32,
             y1 + box / 2,
             anchor="w",
@@ -3516,9 +3754,9 @@ class RelativeChart:
         )
 
         y2 = y1 + row_h
-        self.canvas.create_rectangle(x0, y2, x0 + box, y2 + box, fill=PAIR_2_UP, outline=PAIR_2_UP)
-        self.canvas.create_rectangle(x0 + 14, y2, x0 + 14 + box, y2 + box, fill=PAIR_2_DOWN, outline=PAIR_2_DOWN)
-        self.canvas.create_text(
+        self.candle_canvas.create_rectangle(x0, y2, x0 + box, y2 + box, fill=PAIR_2_UP, outline=PAIR_2_UP)
+        self.candle_canvas.create_rectangle(x0 + 14, y2, x0 + 14 + box, y2 + box, fill=PAIR_2_DOWN, outline=PAIR_2_DOWN)
+        self.candle_canvas.create_text(
             x0 + 32,
             y2 + box / 2,
             anchor="w",
@@ -3529,7 +3767,7 @@ class RelativeChart:
 
     def _draw_trade_arrows(
         self,
-        last_points: list[dict[str, float | int]],
+        last_points: list[dict[str, float]],
         symbol_1: str,
         symbol_2: str,
         trade_plan: TradePlan,
@@ -3545,64 +3783,40 @@ class RelativeChart:
 
         for point in last_points:
             if sell_is_p1:
-                self._draw_sell_arrow(
-                    x=float(point["p1_x"]),
-                    y=float(point["p1_high_y"]) - 18,
-                    color=sell_color,
-                )
+                self._draw_sell_arrow(float(point["p1_x"]), float(point["p1_high_y"]) - 18, sell_color)
             if buy_is_p1:
-                self._draw_buy_arrow(
-                    x=float(point["p1_x"]),
-                    y=float(point["p1_low_y"]) + 18,
-                    color=buy_color,
-                    height=height,
-                )
+                self._draw_buy_arrow(float(point["p1_x"]), float(point["p1_low_y"]) + 18, buy_color, height)
 
             if sell_is_p2:
-                self._draw_sell_arrow(
-                    x=float(point["p2_x"]),
-                    y=float(point["p2_high_y"]) - 18,
-                    color=sell_color,
-                )
+                self._draw_sell_arrow(float(point["p2_x"]), float(point["p2_high_y"]) - 18, sell_color)
             if buy_is_p2:
-                self._draw_buy_arrow(
-                    x=float(point["p2_x"]),
-                    y=float(point["p2_low_y"]) + 18,
-                    color=buy_color,
-                    height=height,
-                )
+                self._draw_buy_arrow(float(point["p2_x"]), float(point["p2_low_y"]) + 18, buy_color, height)
 
     def _draw_sell_arrow(self, x: float, y: float, color: str) -> None:
         y = max(92.0, y)
-        self.canvas.create_text(
-            x,
-            y,
-            anchor="s",
-            fill=color,
-            font=("Segoe UI", 12, "bold"),
-            text="↓",
-        )
+        self.candle_canvas.create_text(x, y, anchor="s", fill=color, font=("Segoe UI", 12, "bold"), text="↓")
 
     def _draw_buy_arrow(self, x: float, y: float, color: str, height: int) -> None:
         y = min(float(height - 20), y)
-        self.canvas.create_text(
-            x,
-            y,
-            anchor="n",
-            fill=color,
-            font=("Segoe UI", 12, "bold"),
-            text="↑",
-        )
+        self.candle_canvas.create_text(x, y, anchor="n", fill=color, font=("Segoe UI", 12, "bold"), text="↑")
 
-    def _draw_body(self, x: float, y_open: float, y_close: float, half_width: float, color: str) -> None:
+    def _draw_body(
+        self,
+        canvas: tk.Canvas,
+        x: float,
+        y_open: float,
+        y_close: float,
+        half_width: float,
+        color: str,
+    ) -> None:
         top = min(y_open, y_close)
         bottom = max(y_open, y_close)
 
         if abs(bottom - top) < 2:
-            self.canvas.create_line(x - half_width, y_close, x + half_width, y_close, fill=color, width=3)
+            canvas.create_line(x - half_width, y_close, x + half_width, y_close, fill=color, width=3)
             return
 
-        self.canvas.create_rectangle(
+        canvas.create_rectangle(
             x - half_width,
             top,
             x + half_width,

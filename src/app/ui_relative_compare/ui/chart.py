@@ -19,9 +19,8 @@ from src.app.ui_relative_compare.constants import (
 from src.app.ui_relative_compare.models import DivergenceStats, TradePlan
 
 
-BASE_STEP_X = 28.0
 BASE_BODY_HALF = 4.0
-BASE_WICK_OFFSET = 7.0
+BASE_PAIR_GAP = 10.0
 
 
 class RelativeChart:
@@ -38,6 +37,7 @@ class RelativeChart:
         ratio_1_to_2: float,
         width_adjust_px: int,
         height_adjust_px: int,
+        pair_gap_adjust_px: int,
         divergence_stats: DivergenceStats,
         trade_plan: TradePlan,
     ) -> None:
@@ -48,13 +48,40 @@ class RelativeChart:
             ratio_1_to_2=ratio_1_to_2,
             width_adjust_px=width_adjust_px,
             height_adjust_px=height_adjust_px,
+            pair_gap_adjust_px=pair_gap_adjust_px,
             divergence_stats=divergence_stats,
             trade_plan=trade_plan,
         )
         self._draw_divergence_line(
             divergence_series=divergence_series,
             width_adjust_px=width_adjust_px,
+            pair_gap_adjust_px=pair_gap_adjust_px,
         )
+
+    def _pair_layout(self, width_adjust_px: int, pair_gap_adjust_px: int) -> tuple[float, float, float]:
+        body_half = max(2.0, BASE_BODY_HALF + width_adjust_px * 0.35)
+        pair_gap = max(0.0, BASE_PAIR_GAP + pair_gap_adjust_px)
+        pair_width = body_half * 4.0
+        return body_half, pair_gap, pair_width
+
+    def _pair_total_width(self, count: int, pair_width: float, pair_gap: float) -> float:
+        if count <= 0:
+            return 0.0
+        return count * pair_width + max(0, count - 1) * pair_gap
+
+    def _pair_positions(
+        self,
+        index: int,
+        left_pad: float,
+        body_half: float,
+        pair_gap: float,
+        pair_width: float,
+    ) -> tuple[float, float, float]:
+        pair_left = left_pad + index * (pair_width + pair_gap)
+        p1_x = pair_left + body_half
+        p2_x = pair_left + body_half * 3.0
+        pair_center_x = pair_left + pair_width / 2.0
+        return p1_x, p2_x, pair_center_x
 
     def _draw_candles(
         self,
@@ -64,6 +91,7 @@ class RelativeChart:
         ratio_1_to_2: float,
         width_adjust_px: int,
         height_adjust_px: int,
+        pair_gap_adjust_px: int,
         divergence_stats: DivergenceStats,
         trade_plan: TradePlan,
     ) -> None:
@@ -81,11 +109,8 @@ class RelativeChart:
         bottom_pad = 34
 
         n = len(bars)
-        step_x = max(16.0, BASE_STEP_X + width_adjust_px)
-        body_half = max(2.0, BASE_BODY_HALF + width_adjust_px * 0.35)
-        wick_offset = max(body_half + 2.0, BASE_WICK_OFFSET + width_adjust_px * 0.35)
-
-        total_width = max(viewport_width, left_pad + right_pad + n * step_x + step_x)
+        body_half, pair_gap, pair_width = self._pair_layout(width_adjust_px, pair_gap_adjust_px)
+        total_width = max(viewport_width, left_pad + self._pair_total_width(n, pair_width, pair_gap) + right_pad)
 
         max_abs = 1.0
         for col in ["p1_high", "p1_low", "p1_close", "p2_high", "p2_low", "p2_close"]:
@@ -108,7 +133,7 @@ class RelativeChart:
         last_points: list[dict[str, float]] = []
 
         for i, row in bars.iterrows():
-            x = left_pad + step_x * i + step_x / 2
+            p1_x, p2_x, _ = self._pair_positions(i, left_pad, body_half, pair_gap, pair_width)
 
             p1_high_y = center_y - float(row["p1_high"]) * scale
             p1_low_y = center_y - float(row["p1_low"]) * scale
@@ -120,9 +145,6 @@ class RelativeChart:
 
             p1_color = PAIR_1_UP if float(row["close_1"]) >= float(row["open_1"]) else PAIR_1_DOWN
             p2_color = PAIR_2_UP if float(row["close_2"]) >= float(row["open_2"]) else PAIR_2_DOWN
-
-            p1_x = x - wick_offset
-            p2_x = x + wick_offset
 
             self.candle_canvas.create_line(p1_x, p1_high_y, p1_x, p1_low_y, fill=p1_color, width=1)
             self.candle_canvas.create_line(p2_x, p2_high_y, p2_x, p2_low_y, fill=p2_color, width=1)
@@ -148,7 +170,7 @@ class RelativeChart:
             anchor="n",
             fill=CHART_TEXT,
             font=("Segoe UI", 10),
-            text="свечи рядом, фиксированный размер, горизонтальный скролл",
+            text="внутри пары без зазора, между парами регулируемый отступ, горизонтальный скролл",
         )
 
         self._draw_pair_legend(symbol_1, symbol_2)
@@ -184,7 +206,10 @@ class RelativeChart:
             anchor="se",
             fill=CHART_TEXT,
             font=("Segoe UI", 9),
-            text=f"{symbol_2} | scale coef 1/2 = {ratio_1_to_2:.6f} | width={width_adjust_px:+d}px | height={height_adjust_px:+d}px",
+            text=(
+                f"{symbol_2} | scale coef 1/2 = {ratio_1_to_2:.6f} | "
+                f"width={width_adjust_px:+d}px | height={height_adjust_px:+d}px | pair_gap={pair_gap_adjust_px:+d}px"
+            ),
         )
 
         self.candle_canvas.configure(scrollregion=(0, 0, total_width, height))
@@ -193,6 +218,7 @@ class RelativeChart:
         self,
         divergence_series: pd.Series,
         width_adjust_px: int,
+        pair_gap_adjust_px: int,
     ) -> None:
         self.line_canvas.update_idletasks()
         viewport_width = max(self.line_canvas.winfo_width(), 400)
@@ -207,8 +233,8 @@ class RelativeChart:
         bottom_pad = 22
 
         n = len(divergence_series)
-        step_x = max(16.0, BASE_STEP_X + width_adjust_px)
-        total_width = max(viewport_width, left_pad + right_pad + n * step_x + step_x)
+        body_half, pair_gap, pair_width = self._pair_layout(width_adjust_px, pair_gap_adjust_px)
+        total_width = max(viewport_width, left_pad + self._pair_total_width(n, pair_width, pair_gap) + right_pad)
 
         max_abs = max(1.0, float(divergence_series.abs().max()) if not divergence_series.empty else 1.0)
         mid_y = height / 2
@@ -225,12 +251,14 @@ class RelativeChart:
 
         points: list[float] = []
         for i, value in enumerate(divergence_series.tolist()):
-            x = left_pad + step_x * i + step_x / 2
+            _, _, pair_center_x = self._pair_positions(i, left_pad, body_half, pair_gap, pair_width)
             y = mid_y - float(value) * scale
-            points.extend([x, y])
+            points.extend([pair_center_x, y])
 
         if len(points) >= 4:
             self.line_canvas.create_line(*points, fill="#eab308", width=2, smooth=False)
+        elif len(points) == 2:
+            self.line_canvas.create_oval(points[0] - 2, points[1] - 2, points[0] + 2, points[1] + 2, fill="#eab308", outline="#eab308")
 
         self.line_canvas.create_text(
             left_pad,

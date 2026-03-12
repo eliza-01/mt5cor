@@ -1,6 +1,6 @@
 # src/app/ui_relative_compare/ui/app.py
 # Tk application for scrollable fixed-size relative candles, divergence mode checkbox,
-# close-by-pair with PnL, and opposite-position opening.
+# close-by-pair with PnL, persistent UI settings, and opposite-position opening.
 from __future__ import annotations
 
 import tkinter as tk
@@ -14,6 +14,7 @@ from src.app.ui_relative_compare.services.market import (
     load_two_symbols,
 )
 from src.app.ui_relative_compare.services.trading import close_pair_positions, open_opposite_positions
+from src.app.ui_relative_compare.services.ui_state import UIState, load_ui_state, save_ui_state
 from src.app.ui_relative_compare.ui.chart import RelativeChart
 from src.broker.mt5_client import MT5Client
 from src.common.settings import load_settings
@@ -23,23 +24,27 @@ class RelativeCompareUI(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("MT5 Relative Compare")
-        self.geometry("1380x980")
-        self.minsize(1240, 860)
 
         self.base_cfg = load_settings()
+        self.saved_state = load_ui_state(self.base_cfg)
+
+        self.geometry(self.saved_state.window_geometry or "1380x980")
+        self.minsize(1240, 860)
+
         self.client: MT5Client | None = None
         self.connected = False
         self.live_job: str | None = None
+        self.state_save_job: str | None = None
 
-        self.symbol_1_var = tk.StringVar(value="EURUSD")
-        self.symbol_2_var = tk.StringVar(value="AUDUSD")
-        self.timeframe_var = tk.StringVar(value="M1")
-        self.calc_bars_var = tk.StringVar(value="1440")
-        self.visible_bars_var = tk.StringVar(value="120")
-        self.refresh_ms_var = tk.StringVar(value="250")
-        self.aggregate_bars_var = tk.StringVar(value="1")
-        self.aggregate_info_var = tk.StringVar(value="M1 x 1")
-        self.use_ratio_in_divergence_var = tk.BooleanVar(value=False)
+        self.symbol_1_var = tk.StringVar(value=self.saved_state.symbol_1)
+        self.symbol_2_var = tk.StringVar(value=self.saved_state.symbol_2)
+        self.timeframe_var = tk.StringVar(value=self.saved_state.timeframe)
+        self.calc_bars_var = tk.StringVar(value=self.saved_state.calc_bars)
+        self.visible_bars_var = tk.StringVar(value=self.saved_state.visible_bars)
+        self.refresh_ms_var = tk.StringVar(value=self.saved_state.refresh_ms)
+        self.aggregate_bars_var = tk.StringVar(value=self.saved_state.aggregate_bars)
+        self.aggregate_info_var = tk.StringVar(value=f"{self.saved_state.timeframe} x {self.saved_state.aggregate_bars}")
+        self.use_ratio_in_divergence_var = tk.BooleanVar(value=self.saved_state.use_ratio_in_divergence)
 
         self.status_var = tk.StringVar(value="idle")
         self.account_var = tk.StringVar(value="-")
@@ -49,16 +54,21 @@ class RelativeCompareUI(tk.Tk):
         self.ratio_2_to_1_var = tk.StringVar(value="-")
         self.last_bar_time_var = tk.StringVar(value="-")
         self.trade_hint_var = tk.StringVar(value="-")
-        self.width_size_var = tk.StringVar(value="0px")
-        self.height_size_var = tk.StringVar(value="0px")
+
+        self.width_adjust_px = int(self.saved_state.width_adjust_px)
+        self.height_adjust_px = int(self.saved_state.height_adjust_px)
+        self.pair_gap_adjust_px = int(self.saved_state.pair_gap_adjust_px)
+
+        self.width_size_var = tk.StringVar(value=f"{self.width_adjust_px:+d}px")
+        self.height_size_var = tk.StringVar(value=f"{self.height_adjust_px:+d}px")
+        self.pair_gap_size_var = tk.StringVar(value=f"{self.pair_gap_adjust_px:+d}px")
 
         self.relative_metrics: RelativeMetrics | None = None
         self.current_trade_plan: TradePlan | None = None
         self.current_snapshot: RenderSnapshot | None = None
-        self.width_adjust_px = 0
-        self.height_adjust_px = 0
 
         self._build_ui()
+        self._bind_state_persistence()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build_ui(self) -> None:
@@ -107,7 +117,7 @@ class RelativeCompareUI(tk.Tk):
         ttk.Button(controls, text="Стоп", command=self.stop_live).grid(row=1, column=6, pady=(10, 0), sticky="w")
         ttk.Button(controls, text="Разовый рендер", command=self.render_once).grid(row=1, column=7, pady=(10, 0), sticky="w")
 
-        sizing = ttk.LabelFrame(root, text="Фиксированный размер свечей", padding=10)
+        sizing = ttk.LabelFrame(root, text="Фиксированные размеры и отступы", padding=10)
         sizing.pack(fill="x", pady=(10, 0))
 
         ttk.Label(sizing, text="Ширина").grid(row=0, column=0, sticky="w")
@@ -120,7 +130,12 @@ class RelativeCompareUI(tk.Tk):
         ttk.Button(sizing, text="+1px", command=lambda: self.change_size("height", 1)).grid(row=0, column=6, padx=(0, 10), sticky="w")
         ttk.Label(sizing, textvariable=self.height_size_var).grid(row=0, column=7, padx=(0, 18), sticky="w")
 
-        ttk.Button(sizing, text="Сбросить", command=self.reset_size).grid(row=0, column=8, sticky="w")
+        ttk.Label(sizing, text="Между парами").grid(row=0, column=8, sticky="w")
+        ttk.Button(sizing, text="-1px", command=lambda: self.change_pair_gap(-1)).grid(row=0, column=9, padx=(6, 4), sticky="w")
+        ttk.Button(sizing, text="+1px", command=lambda: self.change_pair_gap(1)).grid(row=0, column=10, padx=(0, 10), sticky="w")
+        ttk.Label(sizing, textvariable=self.pair_gap_size_var).grid(row=0, column=11, padx=(0, 18), sticky="w")
+
+        ttk.Button(sizing, text="Сбросить", command=self.reset_size).grid(row=0, column=12, sticky="w")
 
         info = ttk.LabelFrame(root, text="Метрика относительности", padding=10)
         info.pack(fill="x", pady=(10, 0))
@@ -147,11 +162,10 @@ class RelativeCompareUI(tk.Tk):
         ttk.Label(
             hint,
             text=(
-                "Свечи теперь фиксированного размера и не ужимаются от количества баров. "
+                "Свечи внутри пары стоят вплотную без зазора. "
+                "Между соседними парами есть отдельный регулируемый отступ. "
                 "Лента скроллится ползунком, колесом и перетаскиванием мышью. "
-                "Слева от графика есть отдельная зона 200px для агрегации: "
-                "можно собрать несколько баров выбранного timeframe в одну общую свечу. "
-                "Нижняя линия расхождения строится по той же агрегации."
+                "Все изменённые настройки сохраняются и поднимаются при следующем запуске."
             ),
             wraplength=1300,
         ).pack(anchor="w")
@@ -184,20 +198,78 @@ class RelativeCompareUI(tk.Tk):
         charts_right = ttk.Frame(chart_layout)
         charts_right.pack(side="left", fill="both", expand=True)
 
-        self.candle_canvas = tk.Canvas(charts_right, bg="#111111", highlightthickness=0, height=520)
-        self.candle_canvas.pack(fill="both", expand=True)
+        charts_right.columnconfigure(0, weight=1)
+        charts_right.rowconfigure(0, weight=1)
+        charts_right.rowconfigure(1, weight=0)
+        charts_right.rowconfigure(2, weight=0)
 
-        self.line_canvas = tk.Canvas(charts_right, bg="#111111", highlightthickness=0, height=180)
-        self.line_canvas.pack(fill="x", pady=(8, 0))
+        self.candle_canvas = tk.Canvas(charts_right, bg="#111111", highlightthickness=0)
+        self.candle_canvas.grid(row=0, column=0, sticky="nsew")
+
+        self.line_wrap = ttk.Frame(charts_right, height=180)
+        self.line_wrap.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.line_wrap.grid_propagate(False)
+        self.line_wrap.columnconfigure(0, weight=1)
+        self.line_wrap.rowconfigure(0, weight=1)
+
+        self.line_canvas = tk.Canvas(self.line_wrap, bg="#111111", highlightthickness=0, height=180)
+        self.line_canvas.grid(row=0, column=0, sticky="nsew")
 
         self.h_scroll = ttk.Scrollbar(charts_right, orient="horizontal", command=self._on_scrollbar)
-        self.h_scroll.pack(fill="x", pady=(8, 0))
+        self.h_scroll.grid(row=2, column=0, sticky="ew", pady=(8, 0))
 
         self.candle_canvas.configure(xscrollcommand=self._set_scrollbar)
         self.line_canvas.configure(xscrollcommand=self._set_scrollbar)
 
         self.chart = RelativeChart(self.candle_canvas, self.line_canvas)
         self._bind_scroll_events()
+
+    def _bind_state_persistence(self) -> None:
+        tracked = [
+            self.symbol_1_var,
+            self.symbol_2_var,
+            self.timeframe_var,
+            self.calc_bars_var,
+            self.visible_bars_var,
+            self.refresh_ms_var,
+            self.aggregate_bars_var,
+            self.use_ratio_in_divergence_var,
+        ]
+        for var in tracked:
+            var.trace_add("write", self._schedule_state_save)
+        self.bind("<Configure>", self._on_window_configure)
+
+    def _on_window_configure(self, event) -> None:
+        if event.widget is self:
+            self._schedule_state_save()
+
+    def _schedule_state_save(self, *_args) -> None:
+        if self.state_save_job is not None:
+            self.after_cancel(self.state_save_job)
+        self.state_save_job = self.after(250, self._save_state_now)
+
+    def _save_state_now(self) -> None:
+        self.state_save_job = None
+        try:
+            save_ui_state(self.base_cfg, self._collect_ui_state())
+        except Exception:
+            pass
+
+    def _collect_ui_state(self) -> UIState:
+        return UIState(
+            symbol_1=self.symbol_1_var.get().strip() or "EURUSD",
+            symbol_2=self.symbol_2_var.get().strip() or "AUDUSD",
+            timeframe=self.timeframe_var.get().strip() or "M1",
+            calc_bars=self.calc_bars_var.get().strip() or "1440",
+            visible_bars=self.visible_bars_var.get().strip() or "120",
+            refresh_ms=self.refresh_ms_var.get().strip() or "250",
+            aggregate_bars=self.aggregate_bars_var.get().strip() or "1",
+            use_ratio_in_divergence=bool(self.use_ratio_in_divergence_var.get()),
+            width_adjust_px=int(self.width_adjust_px),
+            height_adjust_px=int(self.height_adjust_px),
+            pair_gap_adjust_px=int(self.pair_gap_adjust_px),
+            window_geometry=str(self.geometry()),
+        )
 
     def _bind_scroll_events(self) -> None:
         for widget in (self.candle_canvas, self.line_canvas):
@@ -260,6 +332,7 @@ class RelativeCompareUI(tk.Tk):
             self.connected = True
             self.status_var.set("connected")
             self.account_var.set(f"{self.base_cfg.mt5_login} @ {self.base_cfg.mt5_server}")
+            self._schedule_state_save()
         except Exception as exc:
             self.status_var.set("connect_error")
             messagebox.showerror("MT5", str(exc))
@@ -303,6 +376,7 @@ class RelativeCompareUI(tk.Tk):
             self.ratio_2_to_1_var.set(f"{self.relative_metrics.ratio_2_to_1:.6f}")
 
             self.status_var.set("ratio_ready")
+            self._schedule_state_save()
             self.render_once()
         except Exception as exc:
             self.status_var.set("ratio_error")
@@ -357,9 +431,12 @@ class RelativeCompareUI(tk.Tk):
                 ratio_1_to_2=self.relative_metrics.ratio_1_to_2,
                 width_adjust_px=self.width_adjust_px,
                 height_adjust_px=self.height_adjust_px,
+                pair_gap_adjust_px=self.pair_gap_adjust_px,
                 divergence_stats=snapshot.divergence_stats,
                 trade_plan=snapshot.trade_plan,
             )
+
+            self.update_idletasks()
 
             if had_snapshot:
                 self._sync_canvas_view(prev_x)
@@ -367,11 +444,13 @@ class RelativeCompareUI(tk.Tk):
                 self._sync_canvas_view(1.0)
 
             self.status_var.set("rendered")
+            self._schedule_state_save()
         except Exception as exc:
             self.status_var.set("render_error")
             messagebox.showerror("Рендер", str(exc))
 
     def on_toggle_divergence_mode(self) -> None:
+        self._schedule_state_save()
         if self.current_snapshot is not None:
             self.render_once()
 
@@ -383,14 +462,28 @@ class RelativeCompareUI(tk.Tk):
             self.height_adjust_px += delta
             self.height_size_var.set(f"{self.height_adjust_px:+d}px")
 
+        self._schedule_state_save()
+        if self.current_snapshot is not None:
+            self.render_once()
+
+    def change_pair_gap(self, delta: int) -> None:
+        self.pair_gap_adjust_px += delta
+        self.pair_gap_size_var.set(f"{self.pair_gap_adjust_px:+d}px")
+
+        self._schedule_state_save()
         if self.current_snapshot is not None:
             self.render_once()
 
     def reset_size(self) -> None:
         self.width_adjust_px = 0
         self.height_adjust_px = 0
+        self.pair_gap_adjust_px = 0
+
         self.width_size_var.set("0px")
         self.height_size_var.set("0px")
+        self.pair_gap_size_var.set("0px")
+
+        self._schedule_state_save()
         if self.current_snapshot is not None:
             self.render_once()
 
@@ -471,6 +564,7 @@ class RelativeCompareUI(tk.Tk):
 
     def on_close(self) -> None:
         try:
+            self._save_state_now()
             self.stop_live()
             if self.client is not None and self.connected:
                 self.client.shutdown()
