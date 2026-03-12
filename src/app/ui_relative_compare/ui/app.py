@@ -1,6 +1,5 @@
-
 # src/app/ui_relative_compare/ui/app.py
-# Tk application for non-mirrored relative candles, divergence mode checkbox,
+# Tk application for scrollable fixed-size relative candles, divergence mode checkbox,
 # close-by-pair with PnL, and opposite-position opening.
 from __future__ import annotations
 
@@ -24,8 +23,8 @@ class RelativeCompareUI(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("MT5 Relative Compare")
-        self.geometry("1360x900")
-        self.minsize(1220, 800)
+        self.geometry("1380x980")
+        self.minsize(1240, 860)
 
         self.base_cfg = load_settings()
         self.client: MT5Client | None = None
@@ -35,9 +34,11 @@ class RelativeCompareUI(tk.Tk):
         self.symbol_1_var = tk.StringVar(value="EURUSD")
         self.symbol_2_var = tk.StringVar(value="AUDUSD")
         self.timeframe_var = tk.StringVar(value="M1")
-        self.calc_bars_var = tk.StringVar(value="240")
-        self.visible_bars_var = tk.StringVar(value="40")
-        self.refresh_ms_var = tk.StringVar(value="1000")
+        self.calc_bars_var = tk.StringVar(value="1440")
+        self.visible_bars_var = tk.StringVar(value="120")
+        self.refresh_ms_var = tk.StringVar(value="250")
+        self.aggregate_bars_var = tk.StringVar(value="1")
+        self.aggregate_info_var = tk.StringVar(value="M1 x 1")
         self.use_ratio_in_divergence_var = tk.BooleanVar(value=False)
 
         self.status_var = tk.StringVar(value="idle")
@@ -87,7 +88,7 @@ class RelativeCompareUI(tk.Tk):
         ttk.Label(controls, text="Баров для расчёта").grid(row=0, column=6, sticky="w")
         ttk.Entry(controls, textvariable=self.calc_bars_var, width=8).grid(row=0, column=7, padx=(6, 14), sticky="w")
 
-        ttk.Label(controls, text="Видимых свечей").grid(row=0, column=8, sticky="w")
+        ttk.Label(controls, text="Баров в ленте").grid(row=0, column=8, sticky="w")
         ttk.Entry(controls, textvariable=self.visible_bars_var, width=8).grid(row=0, column=9, padx=(6, 14), sticky="w")
 
         ttk.Label(controls, text="Refresh ms").grid(row=0, column=10, sticky="w")
@@ -106,7 +107,7 @@ class RelativeCompareUI(tk.Tk):
         ttk.Button(controls, text="Стоп", command=self.stop_live).grid(row=1, column=6, pady=(10, 0), sticky="w")
         ttk.Button(controls, text="Разовый рендер", command=self.render_once).grid(row=1, column=7, pady=(10, 0), sticky="w")
 
-        sizing = ttk.LabelFrame(root, text="Общий размер свечей", padding=10)
+        sizing = ttk.LabelFrame(root, text="Фиксированный размер свечей", padding=10)
         sizing.pack(fill="x", pady=(10, 0))
 
         ttk.Label(sizing, text="Ширина").grid(row=0, column=0, sticky="w")
@@ -146,25 +147,107 @@ class RelativeCompareUI(tk.Tk):
         ttk.Label(
             hint,
             text=(
-                "Галочка 'Расхождение с коэф' переключает режим расчёта расхождения: "
-                "без неё показываются реальные пункты, с ней — пункты с пересчётом по рассчитанному коэффициенту. "
-                "В правом верхнем углу ленты показывается сумма по всей видимой ленте, "
-                "отдельно текущая свеча и live-расхождение незакрытой свечи по bid. "
-                "Кнопка close закрывает все позиции по двум выбранным символам и показывает pnl."
+                "Свечи теперь фиксированного размера и не ужимаются от количества баров. "
+                "Лента скроллится ползунком, колесом и перетаскиванием мышью. "
+                "Слева от графика есть отдельная зона 200px для агрегации: "
+                "можно собрать несколько баров выбранного timeframe в одну общую свечу. "
+                "Нижняя линия расхождения строится по той же агрегации."
             ),
-            wraplength=1280,
+            wraplength=1300,
         ).pack(anchor="w")
 
         chart_wrap = ttk.LabelFrame(root, text="Сравнение свечей", padding=8)
         chart_wrap.pack(fill="both", expand=True, pady=(10, 0))
 
-        self.canvas = tk.Canvas(chart_wrap, bg="#111111", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
-        self.chart = RelativeChart(self.canvas)
+        chart_layout = ttk.Frame(chart_wrap)
+        chart_layout.pack(fill="both", expand=True)
+
+        self.left_chart_panel = ttk.Frame(chart_layout, width=200)
+        self.left_chart_panel.pack(side="left", fill="y")
+        self.left_chart_panel.pack_propagate(False)
+
+        ttk.Label(self.left_chart_panel, text="Агрегация ленты", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(4, 10))
+        ttk.Label(self.left_chart_panel, text="Баров в 1 свече").pack(anchor="w")
+        ttk.Entry(self.left_chart_panel, textvariable=self.aggregate_bars_var, width=10).pack(anchor="w", pady=(4, 10))
+        ttk.Button(self.left_chart_panel, text="Применить", command=self.render_once).pack(anchor="w", pady=(0, 10))
+        ttk.Label(self.left_chart_panel, text="Текущая сборка").pack(anchor="w")
+        ttk.Label(self.left_chart_panel, textvariable=self.aggregate_info_var).pack(anchor="w", pady=(4, 10))
+        ttk.Label(
+            self.left_chart_panel,
+            text="Итоговая свеча = выбранный timeframe x указанное число баров.",
+            wraplength=180,
+            justify="left",
+        ).pack(anchor="w", pady=(6, 0))
+
+        ttk.Separator(chart_layout, orient="vertical").pack(side="left", fill="y", padx=8)
+
+        charts_right = ttk.Frame(chart_layout)
+        charts_right.pack(side="left", fill="both", expand=True)
+
+        self.candle_canvas = tk.Canvas(charts_right, bg="#111111", highlightthickness=0, height=520)
+        self.candle_canvas.pack(fill="both", expand=True)
+
+        self.line_canvas = tk.Canvas(charts_right, bg="#111111", highlightthickness=0, height=180)
+        self.line_canvas.pack(fill="x", pady=(8, 0))
+
+        self.h_scroll = ttk.Scrollbar(charts_right, orient="horizontal", command=self._on_scrollbar)
+        self.h_scroll.pack(fill="x", pady=(8, 0))
+
+        self.candle_canvas.configure(xscrollcommand=self._set_scrollbar)
+        self.line_canvas.configure(xscrollcommand=self._set_scrollbar)
+
+        self.chart = RelativeChart(self.candle_canvas, self.line_canvas)
+        self._bind_scroll_events()
+
+    def _bind_scroll_events(self) -> None:
+        for widget in (self.candle_canvas, self.line_canvas):
+            widget.bind("<MouseWheel>", self._on_mousewheel_horizontal)
+            widget.bind("<Shift-MouseWheel>", self._on_mousewheel_horizontal)
+            widget.bind("<Button-4>", self._on_mousewheel_horizontal)
+            widget.bind("<Button-5>", self._on_mousewheel_horizontal)
+            widget.bind("<ButtonPress-1>", self._on_scan_mark)
+            widget.bind("<B1-Motion>", self._on_scan_drag)
 
     def _kv(self, parent: ttk.Widget, row: int, col: int, key: str, var: tk.StringVar) -> None:
         ttk.Label(parent, text=key).grid(row=row, column=col, sticky="w", padx=(0, 6), pady=4)
         ttk.Label(parent, textvariable=var).grid(row=row, column=col + 1, sticky="w", padx=(0, 18), pady=4)
+
+    def _set_scrollbar(self, first: str, last: str) -> None:
+        self.h_scroll.set(first, last)
+
+    def _on_scrollbar(self, *args) -> None:
+        self.candle_canvas.xview(*args)
+        self.line_canvas.xview(*args)
+
+    def _sync_canvas_view(self, first_fraction: float) -> None:
+        pos = max(0.0, min(1.0, float(first_fraction)))
+        self.candle_canvas.xview_moveto(pos)
+        self.line_canvas.xview_moveto(pos)
+
+    def _on_mousewheel_horizontal(self, event) -> str:
+        if getattr(event, "num", None) == 4:
+            delta_units = -3
+        elif getattr(event, "num", None) == 5:
+            delta_units = 3
+        else:
+            delta = int(getattr(event, "delta", 0) or 0)
+            if delta == 0:
+                return "break"
+            delta_units = -3 if delta > 0 else 3
+
+        self.candle_canvas.xview_scroll(delta_units, "units")
+        self.line_canvas.xview_scroll(delta_units, "units")
+        return "break"
+
+    def _on_scan_mark(self, event) -> str:
+        self.candle_canvas.scan_mark(event.x, 0)
+        self.line_canvas.scan_mark(event.x, 0)
+        return "break"
+
+    def _on_scan_drag(self, event) -> str:
+        self.candle_canvas.scan_dragto(event.x, 0, gain=1)
+        self.line_canvas.scan_dragto(event.x, 0, gain=1)
+        return "break"
 
     def connect_mt5(self) -> None:
         try:
@@ -187,7 +270,7 @@ class RelativeCompareUI(tk.Tk):
         if not self.connected or self.client is None:
             raise RuntimeError("MT5 не подключен")
 
-    def _read_inputs(self) -> tuple[str, str, str, int, int, int]:
+    def _read_inputs(self) -> tuple[str, str, str, int, int, int, int]:
         symbol_1 = self.symbol_1_var.get().strip()
         symbol_2 = self.symbol_2_var.get().strip()
         timeframe = self.timeframe_var.get().strip()
@@ -195,21 +278,22 @@ class RelativeCompareUI(tk.Tk):
         if timeframe not in TIMEFRAME_MINUTES:
             raise RuntimeError("Неподдерживаемый timeframe")
 
-        calc_bars = max(20, int(self.calc_bars_var.get().strip() or "240"))
-        visible_bars = max(5, int(self.visible_bars_var.get().strip() or "40"))
-        refresh_ms = max(300, int(self.refresh_ms_var.get().strip() or "1000"))
+        calc_bars = max(20, int(self.calc_bars_var.get().strip() or "1440"))
+        visible_bars = max(20, int(self.visible_bars_var.get().strip() or "120"))
+        refresh_ms = max(100, int(self.refresh_ms_var.get().strip() or "250"))
+        aggregate_bars = max(1, int(self.aggregate_bars_var.get().strip() or "1"))
 
         if symbol_1 == symbol_2:
             raise RuntimeError("Нужно выбрать две разные пары")
 
-        return symbol_1, symbol_2, timeframe, calc_bars, visible_bars, refresh_ms
+        return symbol_1, symbol_2, timeframe, calc_bars, visible_bars, refresh_ms, aggregate_bars
 
     def calculate_ratio(self) -> None:
         try:
             self._ensure_connected()
             assert self.client is not None
 
-            symbol_1, symbol_2, timeframe, calc_bars, _, _ = self._read_inputs()
+            symbol_1, symbol_2, timeframe, calc_bars, _, _, _ = self._read_inputs()
             frame, meta_1, meta_2 = load_two_symbols(self.client, symbol_1, symbol_2, timeframe, calc_bars)
             self.relative_metrics = calculate_relative_metrics(frame, meta_1.digits, meta_2.digits, timeframe)
 
@@ -232,7 +316,10 @@ class RelativeCompareUI(tk.Tk):
             if self.relative_metrics is None:
                 raise RuntimeError("Сначала нажми 'Рассчитать коэффициент'")
 
-            symbol_1, symbol_2, timeframe, _, visible_bars, _ = self._read_inputs()
+            symbol_1, symbol_2, timeframe, _, visible_bars, _, aggregate_bars = self._read_inputs()
+            prev_x = self.candle_canvas.xview()[0]
+            had_snapshot = self.current_snapshot is not None
+
             snapshot = build_render_snapshot(
                 client=self.client,
                 cfg=self.base_cfg,
@@ -242,6 +329,7 @@ class RelativeCompareUI(tk.Tk):
                 bars_count=visible_bars,
                 ratio_1_to_2=self.relative_metrics.ratio_1_to_2,
                 use_ratio_in_divergence=self.use_ratio_in_divergence_var.get(),
+                bars_per_candle=aggregate_bars,
             )
 
             self.current_snapshot = snapshot
@@ -249,6 +337,8 @@ class RelativeCompareUI(tk.Tk):
 
             if snapshot.bars.empty:
                 return
+
+            self.aggregate_info_var.set(f"{timeframe} x {aggregate_bars} | {len(snapshot.bars)} свечей")
 
             self.last_bar_time_var.set(str(snapshot.bars.iloc[-1]["time"]))
             self.trade_hint_var.set(
@@ -261,13 +351,21 @@ class RelativeCompareUI(tk.Tk):
 
             self.chart.draw(
                 bars=snapshot.bars,
+                divergence_series=snapshot.divergence_series,
                 symbol_1=symbol_1,
                 symbol_2=symbol_2,
                 ratio_1_to_2=self.relative_metrics.ratio_1_to_2,
                 width_adjust_px=self.width_adjust_px,
                 height_adjust_px=self.height_adjust_px,
                 divergence_stats=snapshot.divergence_stats,
+                trade_plan=snapshot.trade_plan,
             )
+
+            if had_snapshot:
+                self._sync_canvas_view(prev_x)
+            else:
+                self._sync_canvas_view(1.0)
+
             self.status_var.set("rendered")
         except Exception as exc:
             self.status_var.set("render_error")
@@ -324,7 +422,7 @@ class RelativeCompareUI(tk.Tk):
             self._ensure_connected()
             assert self.client is not None
 
-            symbol_1, symbol_2, _, _, _, _ = self._read_inputs()
+            symbol_1, symbol_2, _, _, _, _, _ = self._read_inputs()
             summary = close_pair_positions(self.client, self.base_cfg, symbol_1, symbol_2)
             self.status_var.set("positions_closed")
             messagebox.showinfo(
@@ -359,9 +457,9 @@ class RelativeCompareUI(tk.Tk):
             pass
         finally:
             try:
-                _, _, _, _, _, refresh_ms = self._read_inputs()
+                _, _, _, _, _, refresh_ms, _ = self._read_inputs()
             except Exception:
-                refresh_ms = 1000
+                refresh_ms = 250
             self.live_job = self.after(refresh_ms, self._live_tick)
 
     def stop_live(self) -> None:

@@ -1,4 +1,3 @@
-
 # src/app/ui_relative_compare/models.py
 # Dataclasses for metrics, render snapshot, divergence stats, and trade plan.
 from __future__ import annotations
@@ -42,6 +41,7 @@ class RenderSnapshot:
     bars: pd.DataFrame
     metrics: RelativeMetrics
     divergence_stats: DivergenceStats
+    divergence_series: pd.Series
     trade_plan: TradePlan
     digits_1: int
     digits_2: int
