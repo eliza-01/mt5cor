@@ -1,6 +1,6 @@
 # src/app/ui_relative_compare/ui/app.py
 # Tk application for scrollable fixed-size relative candles, divergence mode checkbox,
-# close-by-pair with PnL, persistent UI settings, and opposite-position opening.
+# close-by-pair with PnL, persistent UI settings, interval selection stats, and opposite-position opening.
 from __future__ import annotations
 
 import tkinter as tk
@@ -55,6 +55,11 @@ class RelativeCompareUI(tk.Tk):
         self.last_bar_time_var = tk.StringVar(value="-")
         self.trade_hint_var = tk.StringVar(value="-")
 
+        self.selection_range_var = tk.StringVar(value="-")
+        self.selection_pair_1_var = tk.StringVar(value="-")
+        self.selection_pair_2_var = tk.StringVar(value="-")
+        self.selection_diff_var = tk.StringVar(value="-")
+
         self.width_adjust_px = int(self.saved_state.width_adjust_px)
         self.height_adjust_px = int(self.saved_state.height_adjust_px)
         self.pair_gap_adjust_px = int(self.saved_state.pair_gap_adjust_px)
@@ -66,6 +71,12 @@ class RelativeCompareUI(tk.Tk):
         self.relative_metrics: RelativeMetrics | None = None
         self.current_trade_plan: TradePlan | None = None
         self.current_snapshot: RenderSnapshot | None = None
+
+        self.selected_start_index: int | None = None
+        self.selected_end_index: int | None = None
+
+        self.drag_start_x = 0
+        self.drag_active = False
 
         self._build_ui()
         self._bind_state_persistence()
@@ -157,6 +168,13 @@ class RelativeCompareUI(tk.Tk):
         self.close_button = ttk.Button(trade, text="Закрыть все по связке", command=self.close_current_pair_positions)
         self.close_button.grid(row=0, column=3, padx=(8, 0), sticky="w")
 
+        selection = ttk.LabelFrame(root, text="Выбранный отрезок close-to-close", padding=10)
+        selection.pack(fill="x", pady=(10, 0))
+        self._kv(selection, 0, 0, "Отрезок", self.selection_range_var)
+        self._kv(selection, 1, 0, "Пара 1", self.selection_pair_1_var)
+        self._kv(selection, 1, 2, "Пара 2", self.selection_pair_2_var)
+        self._kv(selection, 1, 4, "Diff", self.selection_diff_var)
+
         hint = ttk.LabelFrame(root, text="Смысл", padding=10)
         hint.pack(fill="x", pady=(10, 0))
         ttk.Label(
@@ -164,7 +182,8 @@ class RelativeCompareUI(tk.Tk):
             text=(
                 "Свечи внутри пары стоят вплотную без зазора. "
                 "Между соседними парами есть отдельный регулируемый отступ. "
-                "Лента скроллится ползунком, колесом и перетаскиванием мышью. "
+                "Клик по паре свечей или по точке нижнего графика выбирает отрезок: "
+                "первый клик — старт, второй — конец. Расчёт идёт close-to-close. "
                 "Все изменённые настройки сохраняются и поднимаются при следующем запуске."
             ),
             wraplength=1300,
@@ -277,8 +296,9 @@ class RelativeCompareUI(tk.Tk):
             widget.bind("<Shift-MouseWheel>", self._on_mousewheel_horizontal)
             widget.bind("<Button-4>", self._on_mousewheel_horizontal)
             widget.bind("<Button-5>", self._on_mousewheel_horizontal)
-            widget.bind("<ButtonPress-1>", self._on_scan_mark)
+            widget.bind("<ButtonPress-1>", self._on_button_press)
             widget.bind("<B1-Motion>", self._on_scan_drag)
+            widget.bind("<ButtonRelease-1>", self._on_button_release)
 
     def _kv(self, parent: ttk.Widget, row: int, col: int, key: str, var: tk.StringVar) -> None:
         ttk.Label(parent, text=key).grid(row=row, column=col, sticky="w", padx=(0, 6), pady=4)
@@ -311,15 +331,50 @@ class RelativeCompareUI(tk.Tk):
         self.line_canvas.xview_scroll(delta_units, "units")
         return "break"
 
-    def _on_scan_mark(self, event) -> str:
+    def _on_button_press(self, event) -> str:
+        self.drag_start_x = int(event.x)
+        self.drag_active = False
         self.candle_canvas.scan_mark(event.x, 0)
         self.line_canvas.scan_mark(event.x, 0)
         return "break"
 
     def _on_scan_drag(self, event) -> str:
+        if abs(int(event.x) - self.drag_start_x) >= 4:
+            self.drag_active = True
         self.candle_canvas.scan_dragto(event.x, 0, gain=1)
         self.line_canvas.scan_dragto(event.x, 0, gain=1)
         return "break"
+
+    def _on_button_release(self, event) -> str:
+        if not self.drag_active:
+            self._handle_chart_click(event.widget, int(event.x))
+        self.drag_active = False
+        return "break"
+
+    def _handle_chart_click(self, widget: tk.Widget, x_local: int) -> None:
+        if self.current_snapshot is None or self.current_snapshot.bars.empty:
+            return
+
+        canvas = self.candle_canvas if widget is self.candle_canvas else self.line_canvas
+        x_world = float(canvas.canvasx(x_local))
+        index = self.chart.get_index_at_x(
+            bars_count=len(self.current_snapshot.bars),
+            x_world=x_world,
+            width_adjust_px=self.width_adjust_px,
+            pair_gap_adjust_px=self.pair_gap_adjust_px,
+        )
+        if index is None:
+            return
+
+        if self.selected_start_index is None or self.selected_end_index is not None:
+            self.selected_start_index = index
+            self.selected_end_index = None
+        else:
+            self.selected_end_index = index
+            if self.selected_end_index < self.selected_start_index:
+                self.selected_start_index, self.selected_end_index = self.selected_end_index, self.selected_start_index
+
+        self._redraw_current_snapshot()
 
     def connect_mt5(self) -> None:
         try:
@@ -412,8 +467,8 @@ class RelativeCompareUI(tk.Tk):
             if snapshot.bars.empty:
                 return
 
+            self._normalize_selection_indices(len(snapshot.bars))
             self.aggregate_info_var.set(f"{timeframe} x {aggregate_bars} | {len(snapshot.bars)} свечей")
-
             self.last_bar_time_var.set(str(snapshot.bars.iloc[-1]["time"]))
             self.trade_hint_var.set(
                 f"Лидер {snapshot.trade_plan.leader_symbol} {snapshot.trade_plan.leader_move:.2f} | "
@@ -434,6 +489,8 @@ class RelativeCompareUI(tk.Tk):
                 pair_gap_adjust_px=self.pair_gap_adjust_px,
                 divergence_stats=snapshot.divergence_stats,
                 trade_plan=snapshot.trade_plan,
+                selected_start_index=self.selected_start_index,
+                selected_end_index=self.selected_end_index,
             )
 
             self.update_idletasks()
@@ -444,10 +501,114 @@ class RelativeCompareUI(tk.Tk):
                 self._sync_canvas_view(1.0)
 
             self.status_var.set("rendered")
+            self._update_selection_stats()
             self._schedule_state_save()
         except Exception as exc:
             self.status_var.set("render_error")
             messagebox.showerror("Рендер", str(exc))
+
+    def _redraw_current_snapshot(self) -> None:
+        if self.current_snapshot is None or self.current_snapshot.bars.empty or self.relative_metrics is None:
+            return
+
+        prev_x = self.candle_canvas.xview()[0]
+        self._normalize_selection_indices(len(self.current_snapshot.bars))
+
+        symbol_1 = self.symbol_1_var.get().strip()
+        symbol_2 = self.symbol_2_var.get().strip()
+
+        self.chart.draw(
+            bars=self.current_snapshot.bars,
+            divergence_series=self.current_snapshot.divergence_series,
+            symbol_1=symbol_1,
+            symbol_2=symbol_2,
+            ratio_1_to_2=self.relative_metrics.ratio_1_to_2,
+            width_adjust_px=self.width_adjust_px,
+            height_adjust_px=self.height_adjust_px,
+            pair_gap_adjust_px=self.pair_gap_adjust_px,
+            divergence_stats=self.current_snapshot.divergence_stats,
+            trade_plan=self.current_snapshot.trade_plan,
+            selected_start_index=self.selected_start_index,
+            selected_end_index=self.selected_end_index,
+        )
+
+        self.update_idletasks()
+        self._sync_canvas_view(prev_x)
+        self._update_selection_stats()
+
+    def _normalize_selection_indices(self, bars_count: int) -> None:
+        if bars_count <= 0:
+            self.selected_start_index = None
+            self.selected_end_index = None
+            return
+
+        if self.selected_start_index is not None:
+            self.selected_start_index = max(0, min(bars_count - 1, int(self.selected_start_index)))
+
+        if self.selected_end_index is not None:
+            self.selected_end_index = max(0, min(bars_count - 1, int(self.selected_end_index)))
+
+        if self.selected_start_index is not None and self.selected_end_index is not None:
+            if self.selected_end_index < self.selected_start_index:
+                self.selected_start_index, self.selected_end_index = self.selected_end_index, self.selected_start_index
+
+    def _update_selection_stats(self) -> None:
+        if self.current_snapshot is None or self.current_snapshot.bars.empty:
+            self.selection_range_var.set("-")
+            self.selection_pair_1_var.set("-")
+            self.selection_pair_2_var.set("-")
+            self.selection_diff_var.set("-")
+            return
+
+        if self.selected_start_index is None:
+            self.selection_range_var.set("кликни стартовую пару/точку")
+            self.selection_pair_1_var.set("-")
+            self.selection_pair_2_var.set("-")
+            self.selection_diff_var.set("-")
+            return
+
+        bars = self.current_snapshot.bars
+        start_index = int(self.selected_start_index)
+        end_index = start_index if self.selected_end_index is None else int(self.selected_end_index)
+
+        start_row = bars.iloc[start_index]
+        end_row = bars.iloc[end_index]
+
+        if self.selected_end_index is None:
+            self.selection_range_var.set(f"START: {start_row['time']} | жду END")
+            self.selection_pair_1_var.set("-")
+            self.selection_pair_2_var.set("-")
+            self.selection_diff_var.set("-")
+            return
+
+        move_1_pips = (float(end_row["close_1"]) - float(start_row["close_1"])) / self._pip_size(self.current_snapshot.digits_1)
+        move_2_pips = (float(end_row["close_2"]) - float(start_row["close_2"])) / self._pip_size(self.current_snapshot.digits_2)
+        diff_pips = move_1_pips - move_2_pips
+
+        symbol_1 = self._format_symbol_for_stats(self.symbol_1_var.get().strip())
+        symbol_2 = self._format_symbol_for_stats(self.symbol_2_var.get().strip())
+
+        candles_distance = max(0, end_index - start_index)
+
+        self.selection_range_var.set(
+            f"{start_row['time']} -> {end_row['time']} | свечей между точками: {candles_distance}"
+        )
+        self.selection_pair_1_var.set(f"{symbol_1}: {self._format_pips(move_1_pips)} pip")
+        self.selection_pair_2_var.set(f"{symbol_2}: {self._format_pips(move_2_pips)} pip")
+        self.selection_diff_var.set(f"diff: {self._format_pips(diff_pips)} pip")
+
+    def _pip_size(self, digits: int) -> float:
+        return 0.01 if digits in (2, 3) else 0.0001
+
+    def _format_symbol_for_stats(self, symbol: str) -> str:
+        letters = "".join(ch for ch in symbol.upper() if "A" <= ch <= "Z")
+        if len(letters) >= 6:
+            return f"{letters[:3]}/{letters[3:6]}"
+        return symbol
+
+    def _format_pips(self, value: float) -> str:
+        text = f"{float(value):+.4f}".rstrip("0").rstrip(".")
+        return text if text != "-0" else "0"
 
     def on_toggle_divergence_mode(self) -> None:
         self._schedule_state_save()

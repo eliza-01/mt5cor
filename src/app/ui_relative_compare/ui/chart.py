@@ -21,6 +21,8 @@ from src.app.ui_relative_compare.models import DivergenceStats, TradePlan
 
 BASE_BODY_HALF = 4.0
 BASE_PAIR_GAP = 10.0
+LEFT_PAD = 60
+RIGHT_PAD = 30
 
 
 class RelativeChart:
@@ -40,6 +42,8 @@ class RelativeChart:
         pair_gap_adjust_px: int,
         divergence_stats: DivergenceStats,
         trade_plan: TradePlan,
+        selected_start_index: int | None,
+        selected_end_index: int | None,
     ) -> None:
         self._draw_candles(
             bars=bars,
@@ -51,12 +55,32 @@ class RelativeChart:
             pair_gap_adjust_px=pair_gap_adjust_px,
             divergence_stats=divergence_stats,
             trade_plan=trade_plan,
+            selected_start_index=selected_start_index,
+            selected_end_index=selected_end_index,
         )
         self._draw_divergence_line(
             divergence_series=divergence_series,
             width_adjust_px=width_adjust_px,
             pair_gap_adjust_px=pair_gap_adjust_px,
+            selected_start_index=selected_start_index,
+            selected_end_index=selected_end_index,
         )
+
+    def get_index_at_x(
+        self,
+        bars_count: int,
+        x_world: float,
+        width_adjust_px: int,
+        pair_gap_adjust_px: int,
+    ) -> int | None:
+        if bars_count <= 0:
+            return None
+
+        body_half, pair_gap, pair_width = self._pair_layout(width_adjust_px, pair_gap_adjust_px)
+        step = pair_width + pair_gap
+        center_offset = LEFT_PAD + pair_width / 2.0
+        raw_index = round((x_world - center_offset) / step)
+        return max(0, min(bars_count - 1, int(raw_index)))
 
     def _pair_layout(self, width_adjust_px: int, pair_gap_adjust_px: int) -> tuple[float, float, float]:
         body_half = max(2.0, BASE_BODY_HALF + width_adjust_px * 0.35)
@@ -94,17 +118,29 @@ class RelativeChart:
         pair_gap_adjust_px: int,
         divergence_stats: DivergenceStats,
         trade_plan: TradePlan,
+        selected_start_index: int | None,
+        selected_end_index: int | None,
     ) -> None:
         self.candle_canvas.update_idletasks()
         viewport_width = max(self.candle_canvas.winfo_width(), 400)
         height = max(self.candle_canvas.winfo_height(), 340)
 
+        viewport_left = float(self.candle_canvas.canvasx(0))
+        viewport_right = viewport_left + float(viewport_width)
+
         self.candle_canvas.delete("all")
-        self.candle_canvas.create_rectangle(0, 0, viewport_width, height, fill=CHART_BG, outline=CHART_BG)
+        self.candle_canvas.create_rectangle(
+            viewport_left,
+            0,
+            viewport_right,
+            height,
+            fill=CHART_BG,
+            outline=CHART_BG,
+        )
 
         center_y = height / 2
-        left_pad = 60
-        right_pad = 30
+        left_pad = LEFT_PAD
+        right_pad = RIGHT_PAD
         top_pad = 118
         bottom_pad = 34
 
@@ -164,8 +200,26 @@ class RelativeChart:
                     }
                 )
 
+        self._draw_selection_on_candles(
+            bars=bars,
+            body_half=body_half,
+            pair_gap=pair_gap,
+            pair_width=pair_width,
+            center_y=center_y,
+            scale=scale,
+            height=height,
+            top_pad=top_pad,
+            bottom_pad=bottom_pad,
+            selected_start_index=selected_start_index,
+            selected_end_index=selected_end_index,
+        )
+
+        title_x = viewport_left + viewport_width / 2.0
+        fixed_left_x = viewport_left + 16
+        fixed_right_x = viewport_right - 16
+
         self.candle_canvas.create_text(
-            total_width / 2,
+            title_x,
             10,
             anchor="n",
             fill=CHART_TEXT,
@@ -173,7 +227,7 @@ class RelativeChart:
             text="внутри пары без зазора, между парами регулируемый отступ, горизонтальный скролл",
         )
 
-        self._draw_pair_legend(symbol_1, symbol_2)
+        self._draw_pair_legend(symbol_1, symbol_2, fixed_left_x, 10)
 
         mode_text = "с коэф" if divergence_stats.uses_ratio else "реал"
         divergence_text = (
@@ -183,7 +237,7 @@ class RelativeChart:
             f"Live bid Δ: {divergence_stats.live_diff_pips:+.2f} п"
         )
         self.candle_canvas.create_text(
-            total_width - right_pad,
+            fixed_right_x,
             10,
             anchor="ne",
             fill=CHART_TEXT,
@@ -201,7 +255,7 @@ class RelativeChart:
         )
 
         self.candle_canvas.create_text(
-            total_width - right_pad,
+            fixed_right_x,
             height - 10,
             anchor="se",
             fill=CHART_TEXT,
@@ -219,16 +273,28 @@ class RelativeChart:
         divergence_series: pd.Series,
         width_adjust_px: int,
         pair_gap_adjust_px: int,
+        selected_start_index: int | None,
+        selected_end_index: int | None,
     ) -> None:
         self.line_canvas.update_idletasks()
         viewport_width = max(self.line_canvas.winfo_width(), 400)
         height = max(self.line_canvas.winfo_height(), 120)
 
-        self.line_canvas.delete("all")
-        self.line_canvas.create_rectangle(0, 0, viewport_width, height, fill=CHART_BG, outline=CHART_BG)
+        viewport_left = float(self.line_canvas.canvasx(0))
+        viewport_right = viewport_left + float(viewport_width)
 
-        left_pad = 60
-        right_pad = 30
+        self.line_canvas.delete("all")
+        self.line_canvas.create_rectangle(
+            viewport_left,
+            0,
+            viewport_right,
+            height,
+            fill=CHART_BG,
+            outline=CHART_BG,
+        )
+
+        left_pad = LEFT_PAD
+        right_pad = RIGHT_PAD
         top_pad = 18
         bottom_pad = 22
 
@@ -260,8 +326,20 @@ class RelativeChart:
         elif len(points) == 2:
             self.line_canvas.create_oval(points[0] - 2, points[1] - 2, points[0] + 2, points[1] + 2, fill="#eab308", outline="#eab308")
 
+        self._draw_selection_on_line(
+            divergence_series=divergence_series,
+            body_half=body_half,
+            pair_gap=pair_gap,
+            pair_width=pair_width,
+            mid_y=mid_y,
+            scale=scale,
+            height=height,
+            selected_start_index=selected_start_index,
+            selected_end_index=selected_end_index,
+        )
+
         self.line_canvas.create_text(
-            left_pad,
+            viewport_left + 16,
             6,
             anchor="nw",
             fill=CHART_TEXT,
@@ -271,9 +349,138 @@ class RelativeChart:
 
         self.line_canvas.configure(scrollregion=(0, 0, total_width, height))
 
-    def _draw_pair_legend(self, symbol_1: str, symbol_2: str) -> None:
-        x0 = 16
-        y0 = 10
+    def _draw_selection_on_candles(
+        self,
+        bars: pd.DataFrame,
+        body_half: float,
+        pair_gap: float,
+        pair_width: float,
+        center_y: float,
+        scale: float,
+        height: float,
+        top_pad: float,
+        bottom_pad: float,
+        selected_start_index: int | None,
+        selected_end_index: int | None,
+    ) -> None:
+        if selected_start_index is None or bars.empty:
+            return
+
+        start_index = max(0, min(len(bars) - 1, int(selected_start_index)))
+        end_index = start_index if selected_end_index is None else max(0, min(len(bars) - 1, int(selected_end_index)))
+
+        if end_index < start_index:
+            start_index, end_index = end_index, start_index
+
+        start_p1_x, start_p2_x, start_center_x = self._pair_positions(start_index, LEFT_PAD, body_half, pair_gap, pair_width)
+        end_p1_x, end_p2_x, end_center_x = self._pair_positions(end_index, LEFT_PAD, body_half, pair_gap, pair_width)
+
+        start_left = start_p1_x - body_half - 4
+        end_right = end_p2_x + body_half + 4
+
+        if end_index > start_index:
+            self.candle_canvas.create_rectangle(
+                start_left,
+                top_pad - 8,
+                end_right,
+                height - bottom_pad + 4,
+                outline="#a78bfa",
+                dash=(5, 3),
+                width=1,
+            )
+
+        self.candle_canvas.create_line(
+            start_center_x,
+            top_pad - 10,
+            start_center_x,
+            height - bottom_pad + 6,
+            fill="#22c55e",
+            dash=(4, 3),
+            width=2,
+        )
+        self.candle_canvas.create_text(
+            start_center_x,
+            top_pad - 16,
+            anchor="s",
+            fill="#22c55e",
+            font=("Segoe UI", 9, "bold"),
+            text="START",
+        )
+
+        if selected_end_index is not None:
+            self.candle_canvas.create_line(
+                end_center_x,
+                top_pad - 10,
+                end_center_x,
+                height - bottom_pad + 6,
+                fill="#ef4444",
+                dash=(4, 3),
+                width=2,
+            )
+            self.candle_canvas.create_text(
+                end_center_x,
+                top_pad - 16,
+                anchor="s",
+                fill="#ef4444",
+                font=("Segoe UI", 9, "bold"),
+                text="END",
+            )
+
+        start_row = bars.iloc[start_index]
+        self._draw_marker(self.candle_canvas, start_p1_x, center_y - float(start_row["p1_close"]) * scale, "#22c55e")
+        self._draw_marker(self.candle_canvas, start_p2_x, center_y - float(start_row["p2_close"]) * scale, "#22c55e")
+
+        if selected_end_index is not None:
+            end_row = bars.iloc[end_index]
+            self._draw_marker(self.candle_canvas, end_p1_x, center_y - float(end_row["p1_close"]) * scale, "#ef4444")
+            self._draw_marker(self.candle_canvas, end_p2_x, center_y - float(end_row["p2_close"]) * scale, "#ef4444")
+
+    def _draw_selection_on_line(
+        self,
+        divergence_series: pd.Series,
+        body_half: float,
+        pair_gap: float,
+        pair_width: float,
+        mid_y: float,
+        scale: float,
+        height: float,
+        selected_start_index: int | None,
+        selected_end_index: int | None,
+    ) -> None:
+        if selected_start_index is None or divergence_series.empty:
+            return
+
+        start_index = max(0, min(len(divergence_series) - 1, int(selected_start_index)))
+        end_index = start_index if selected_end_index is None else max(0, min(len(divergence_series) - 1, int(selected_end_index)))
+
+        if end_index < start_index:
+            start_index, end_index = end_index, start_index
+
+        _, _, start_center_x = self._pair_positions(start_index, LEFT_PAD, body_half, pair_gap, pair_width)
+        _, _, end_center_x = self._pair_positions(end_index, LEFT_PAD, body_half, pair_gap, pair_width)
+
+        start_y = mid_y - float(divergence_series.iloc[start_index]) * scale
+        end_y = mid_y - float(divergence_series.iloc[end_index]) * scale
+
+        if end_index > start_index:
+            self.line_canvas.create_rectangle(
+                start_center_x - pair_width / 2.0,
+                10,
+                end_center_x + pair_width / 2.0,
+                height - 10,
+                outline="#a78bfa",
+                dash=(5, 3),
+                width=1,
+            )
+
+        self.line_canvas.create_line(start_center_x, 8, start_center_x, height - 8, fill="#22c55e", dash=(4, 3), width=2)
+        self._draw_marker(self.line_canvas, start_center_x, start_y, "#22c55e")
+
+        if selected_end_index is not None:
+            self.line_canvas.create_line(end_center_x, 8, end_center_x, height - 8, fill="#ef4444", dash=(4, 3), width=2)
+            self._draw_marker(self.line_canvas, end_center_x, end_y, "#ef4444")
+
+    def _draw_pair_legend(self, symbol_1: str, symbol_2: str, x0: float, y0: float) -> None:
         row_h = 22
         box = 10
 
@@ -344,6 +551,25 @@ class RelativeChart:
     def _draw_buy_arrow(self, x: float, y: float, color: str, height: int) -> None:
         y = min(float(height - 20), y)
         self.candle_canvas.create_text(x, y, anchor="n", fill=color, font=("Segoe UI", 12, "bold"), text="↑")
+
+    def _draw_marker(self, canvas: tk.Canvas, x: float, y: float, color: str) -> None:
+        radius = 5
+        canvas.create_oval(
+            x - radius,
+            y - radius,
+            x + radius,
+            y + radius,
+            outline=color,
+            width=2,
+        )
+        canvas.create_oval(
+            x - 1,
+            y - 1,
+            x + 1,
+            y + 1,
+            outline=color,
+            fill=color,
+        )
 
     def _draw_body(
         self,
