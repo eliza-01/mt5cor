@@ -1,0 +1,5 @@
+# Runtime dependencies.
+MetaTrader5>=5.0.45
+numpy>=1.26
+pandas>=2.2
+python-dotenv>=1.0

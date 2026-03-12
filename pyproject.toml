@@ -1,0 +1,9 @@
+# Minimal project metadata.
+[project]
+name = "fxrelval-mt5"
+version = "0.1.0"
+description = "MT5 EURUSD/AUDUSD relative-value monitor"
+requires-python = ">=3.11"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
