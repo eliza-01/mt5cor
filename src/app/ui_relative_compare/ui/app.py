@@ -14,7 +14,7 @@ from src.app.ui_relative_compare.services.market import (
     calculate_relative_metrics,
     load_two_symbols,
 )
-from src.app.ui_relative_compare.services.trading import close_pair_positions, open_pair_positions
+from src.app.ui_relative_compare.services.trading import close_pair_positions, open_pair_positions, reverse_pair_positions
 from src.app.ui_relative_compare.services.ui_state import UIState, load_ui_state, save_ui_state
 from src.app.ui_relative_compare.ui.chart import RelativeChart
 from src.broker.mt5_client import MT5Client
@@ -205,7 +205,8 @@ class RelativeCompareUI(tk.Tk):
                 "Нажатие на кнопку всегда открывает противоположную позицию по второй паре. "
                 "Галочка 'Объем автоматически' оставляет текущую логику расчета объема. "
                 "При отключении можно задать объем отдельно для каждой пары вручную. "
-                "Кнопка 'Закрыть все' закрывает все позиции по двум выбранным символам."
+                "Кнопка 'Закрыть все' закрывает все позиции по двум выбранным символам. "
+                "Кнопка 'Развернуть' одновременно закрывает все позиции и открывает их в обратную сторону."
             ),
             wraplength=1300,
         ).pack(anchor="w")
@@ -258,7 +259,8 @@ class RelativeCompareUI(tk.Tk):
         self._make_px_button(header_inner, "SELL", lambda: self.open_direct_order(2, "sell"), 60, 25).pack(side="left", padx=(0, 4))
         self._make_px_button(header_inner, "BUY", lambda: self.open_direct_order(2, "buy"), 60, 25).pack(side="left", padx=(0, 16))
 
-        self._make_px_button(header_inner, "ЗАКРЫТЬ ВСЕ", self.close_current_pair_positions, 110, 25).pack(side="left")
+        self._make_px_button(header_inner, "ЗАКРЫТЬ ВСЕ", self.close_current_pair_positions, 110, 25).pack(side="left", padx=(0, 8))
+        self._make_px_button(header_inner, "РАЗВЕРНУТЬ", self.reverse_current_pair_positions, 110, 25).pack(side="left")
 
         self.candle_canvas = tk.Canvas(charts_right, bg="#111111", highlightthickness=0)
         self.candle_canvas.grid(row=1, column=0, sticky="nsew")
@@ -900,6 +902,40 @@ class RelativeCompareUI(tk.Tk):
         except Exception as exc:
             self.status_var.set("close_error")
             messagebox.showerror("Закрытие позиций по связке", str(exc))
+
+    def reverse_current_pair_positions(self) -> None:
+        try:
+            self._ensure_connected()
+            assert self.client is not None
+
+            symbol_1, symbol_2, _, _, _, _, _ = self._read_inputs()
+            summary = reverse_pair_positions(self.client, self.base_cfg, symbol_1, symbol_2)
+            self.status_var.set("positions_reversed")
+
+            reopened_lines = []
+            for leg in summary.reopened_legs:
+                reopened_lines.append(
+                    f"{leg.side.upper()} {leg.symbol} {leg.volume:.2f} "
+                    f"order={leg.order} retcode={leg.retcode}"
+                )
+
+            messagebox.showinfo(
+                "Позиции развернуты",
+                (
+                    f"Связка: {symbol_1} / {symbol_2}\n"
+                    f"Закрыто позиций: {summary.close_summary.closed_count}\n"
+                    f"Сделок MT: {summary.close_summary.deals_count}\n"
+                    f"MT total pnl: {summary.close_summary.total_pnl_usd:.2f}\n\n"
+                    f"Открыто в обратную сторону:\n"
+                    + "\n".join(reopened_lines)
+                ),
+            )
+
+            if self.current_snapshot is not None:
+                self.render_once()
+        except Exception as exc:
+            self.status_var.set("reverse_error")
+            messagebox.showerror("Разворот позиций по связке", str(exc))
 
     def start_live(self) -> None:
         try:

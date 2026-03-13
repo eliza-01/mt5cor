@@ -1,6 +1,7 @@
 # src/app/ui_relative_compare/services/trading.py
 # Sends opposite market orders for an explicitly selected symbol direction,
-# and closes all positions for the selected pair with PnL summary from actual MT5 deal history.
+# closes all positions for the selected pair with PnL summary from actual MT5 deal history,
+# and can reverse the whole pair in one action.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -41,6 +42,21 @@ class ClosePairSummary:
     swap_usd: float
     fee_usd: float
     total_pnl_usd: float
+
+
+@dataclass(slots=True)
+class ReopenedLeg:
+    symbol: str
+    side: str
+    volume: float
+    retcode: int
+    order: int
+
+
+@dataclass(slots=True)
+class ReversePairSummary:
+    close_summary: ClosePairSummary
+    reopened_legs: list[ReopenedLeg]
 
 
 def _terminal_flags() -> dict:
@@ -311,6 +327,58 @@ def _sum_deals(deals: list) -> tuple[float, float, float, float]:
     return profit_usd, commission_usd, swap_usd, fee_usd
 
 
+def _build_reverse_legs_from_positions(positions: list) -> list[tuple[str, str, float]]:
+    aggregated: dict[tuple[str, str], float] = {}
+
+    for position in positions:
+        symbol = str(position.symbol)
+        volume = float(getattr(position, "volume", 0.0) or 0.0)
+        if volume <= 0:
+            continue
+
+        current_type = int(getattr(position, "type", -1))
+        reverse_side = "sell" if current_type == mt5.ORDER_TYPE_BUY else "buy"
+
+        key = (symbol, reverse_side)
+        aggregated[key] = aggregated.get(key, 0.0) + volume
+
+    legs: list[tuple[str, str, float]] = []
+    for (symbol, side), volume in sorted(aggregated.items(), key=lambda item: (0 if item[0][1] == "sell" else 1, item[0][0])):
+        if volume > 0:
+            legs.append((symbol, side, float(volume)))
+
+    return legs
+
+
+def _open_leg(
+    client: MT5Client,
+    cfg: Settings,
+    symbol: str,
+    side: str,
+    volume: float,
+    deviation: int,
+) -> ReopenedLeg:
+    client.ensure_symbol(symbol)
+    normalized_volume = _normalize_volume(volume, symbol)
+
+    result = _send_market_with_fill_fallback(
+        symbol=symbol,
+        volume=normalized_volume,
+        side=side,
+        deviation=deviation,
+        magic=cfg.mt5_magic,
+        comment="relative_compare_reverse",
+    )
+
+    return ReopenedLeg(
+        symbol=symbol,
+        side=side,
+        volume=normalized_volume,
+        retcode=int(result.retcode),
+        order=int(getattr(result, "order", 0) or 0),
+    )
+
+
 def open_pair_positions(
     client: MT5Client,
     cfg: Settings,
@@ -421,4 +489,66 @@ def close_pair_positions(
         swap_usd=float(swap_usd),
         fee_usd=float(fee_usd),
         total_pnl_usd=float(total_pnl_usd),
+    )
+
+
+def reverse_pair_positions(
+    client: MT5Client,
+    cfg: Settings,
+    symbol_1: str,
+    symbol_2: str,
+    deviation: int = 20,
+) -> ReversePairSummary:
+    _ensure_python_trading_enabled()
+
+    positions = [*_symbol_positions(symbol_1), *_symbol_positions(symbol_2)]
+    if not positions:
+        raise RuntimeError("Нет открытых позиций по текущей связке для разворота")
+
+    reverse_legs = _build_reverse_legs_from_positions(positions)
+    if not reverse_legs:
+        raise RuntimeError("Не удалось построить обратные позиции для разворота")
+
+    close_summary = close_pair_positions(
+        client=client,
+        cfg=cfg,
+        symbol_1=symbol_1,
+        symbol_2=symbol_2,
+        deviation=deviation,
+    )
+
+    reopened_legs: list[ReopenedLeg] = []
+    errors: list[str] = []
+
+    for symbol, side, volume in reverse_legs:
+        try:
+            reopened_legs.append(
+                _open_leg(
+                    client=client,
+                    cfg=cfg,
+                    symbol=symbol,
+                    side=side,
+                    volume=volume,
+                    deviation=deviation,
+                )
+            )
+        except Exception as exc:
+            errors.append(f"{side.upper()} {symbol} {volume:.2f}: {exc}")
+
+    if errors:
+        opened_text = "\n".join(
+            f"{leg.side.upper()} {leg.symbol} {leg.volume:.2f} order={leg.order} retcode={leg.retcode}"
+            for leg in reopened_legs
+        )
+        parts = ["Позиции закрыты, но разворот открыт не полностью."]
+        if opened_text:
+            parts.append("Уже открыто:")
+            parts.append(opened_text)
+        parts.append("Ошибки:")
+        parts.append("\n".join(errors))
+        raise RuntimeError("\n".join(parts))
+
+    return ReversePairSummary(
+        close_summary=close_summary,
+        reopened_legs=reopened_legs,
     )

@@ -1766,499 +1766,6 @@ numpy>=1.26
 pandas>=2.2
 python-dotenv>=1.0
 
-# src/__init__.py
-
-# src/__init__.py
-# Package root.
-
-# src/app/__init__.py
-
-# src/app/__init__.py
-# App entrypoints.
-
-# src/app/analyze_last_2d.py
-# src/app/analyze_last_2d.py
-# Runs the 2-day offline analysis and prints the first summary.
-from __future__ import annotations
-
-from pathlib import Path
-
-from src.broker.mt5_client import MT5Client
-from src.common.logging import get_logger
-from src.common.settings import load_settings
-from src.data.history import load_pair_history
-from src.strategy.features import build_feature_frame
-from src.strategy.simulator import estimate_live_edge, simulate_trades, summarize_trades
-
-
-def main() -> None:
-    cfg = load_settings()
-    logger = get_logger("analyze", cfg.log_level)
-    cfg.data_dir.mkdir(parents=True, exist_ok=True)
-    client = MT5Client(cfg)
-    client.connect()
-    try:
-        meta_1 = client.symbol_meta(cfg.symbol_leg_1)
-        meta_2 = client.symbol_meta(cfg.symbol_leg_2)
-        raw = load_pair_history(client, cfg.symbol_leg_1, cfg.symbol_leg_2, cfg.timeframe, cfg.history_bars)
-        feat = build_feature_frame(raw, cfg)
-        trades = simulate_trades(feat, cfg, meta_1, meta_2)
-        summary = summarize_trades(trades)
-        live = estimate_live_edge(feat, trades, cfg)
-        raw.to_csv(Path(cfg.data_dir, "bars_last_2d.csv"), index=False)
-        feat.to_csv(Path(cfg.data_dir, "features_last_2d.csv"), index=False)
-        if not trades.empty:
-            trades.to_csv(Path(cfg.data_dir, "trades_last_2d.csv"), index=False)
-        logger.info("summary=%s", summary)
-        logger.info("live=%s", live)
-    finally:
-        client.shutdown()
-
-
-if __name__ == "__main__":
-    main()
-
-# src/app/live_watch.py
-# src/app/live_watch.py
-# Polls MT5, rebuilds the state, and prints whether current skew is tradable.
-from __future__ import annotations
-
-import time
-
-from src.broker.mt5_client import MT5Client
-from src.common.logging import get_logger
-from src.common.settings import load_settings
-from src.data.history import load_pair_history
-from src.strategy.features import build_feature_frame
-from src.strategy.simulator import estimate_live_edge, simulate_trades
-
-
-def main() -> None:
-    cfg = load_settings()
-    logger = get_logger("live", cfg.log_level)
-    client = MT5Client(cfg)
-    client.connect()
-    last_bar_time = None
-    try:
-        meta_1 = client.symbol_meta(cfg.symbol_leg_1)
-        meta_2 = client.symbol_meta(cfg.symbol_leg_2)
-        while True:
-            raw = load_pair_history(client, cfg.symbol_leg_1, cfg.symbol_leg_2, cfg.timeframe, cfg.history_bars)
-            feat = build_feature_frame(raw, cfg)
-            if feat.empty:
-                time.sleep(cfg.live_poll_ms / 1000)
-                continue
-            current_bar_time = feat.iloc[-1].time
-            if current_bar_time != last_bar_time:
-                trades = simulate_trades(feat, cfg, meta_1, meta_2)
-                live = estimate_live_edge(feat, trades, cfg)
-                logger.info("time=%s live=%s", current_bar_time, live)
-                last_bar_time = current_bar_time
-            time.sleep(cfg.live_poll_ms / 1000)
-    finally:
-        client.shutdown()
-
-
-if __name__ == "__main__":
-    main()
-
-# src/app/ui.py
-# Minimal desktop UI for live spread/divergence monitoring and quick backtests.
-from __future__ import annotations
-
-from dataclasses import replace
-from datetime import datetime, timezone
-import math
-import tkinter as tk
-from tkinter import ttk, messagebox
-
-import pandas as pd
-
-from src.broker.mt5_client import MT5Client
-from src.common.settings import load_settings
-from src.data.history import load_pair_history
-from src.strategy.costs import pip_size
-from src.strategy.features import build_feature_frame
-from src.strategy.simulator import estimate_live_edge, simulate_trades, summarize_trades
-
-
-TIMEFRAME_BARS_PER_DAY = {
-    "M1": 1440,
-    "M5": 288,
-    "M15": 96,
-    "H1": 24,
-}
-
-
-class App(tk.Tk):
-    def __init__(self) -> None:
-        super().__init__()
-        self.title("MT5 FX Relative Value Monitor")
-        self.geometry("1180x760")
-        self.minsize(1080, 700)
-
-        self.base_cfg = load_settings()
-        self.client = MT5Client(self.base_cfg)
-        self.meta_1 = None
-        self.meta_2 = None
-        self.live_job: str | None = None
-        self.is_connected = False
-
-        self.timeframe_var = tk.StringVar(value=self.base_cfg.timeframe)
-        self.days_var = tk.StringVar(value="2")
-        self.auto_refresh_var = tk.BooleanVar(value=True)
-        self.refresh_ms_var = tk.StringVar(value=str(max(self.base_cfg.live_poll_ms, 1000)))
-
-        self.status_var = tk.StringVar(value="disconnected")
-        self.account_var = tk.StringVar(value="-")
-        self.time_var = tk.StringVar(value="-")
-
-        self.price_1_var = tk.StringVar(value="-")
-        self.price_2_var = tk.StringVar(value="-")
-        self.tick_spread_1_var = tk.StringVar(value="-")
-        self.tick_spread_2_var = tk.StringVar(value="-")
-        self.synth_var = tk.StringVar(value="-")
-
-        self.beta_var = tk.StringVar(value="-")
-        self.corr_var = tk.StringVar(value="-")
-        self.spread_raw_var = tk.StringVar(value="-")
-        self.spread_z_var = tk.StringVar(value="-")
-        self.resid_z_var = tk.StringVar(value="-")
-        self.combo_z_var = tk.StringVar(value="-")
-        self.live_state_var = tk.StringVar(value="-")
-
-        self.summary_trades_var = tk.StringVar(value="-")
-        self.summary_winrate_var = tk.StringVar(value="-")
-        self.summary_gross_var = tk.StringVar(value="-")
-        self.summary_net_var = tk.StringVar(value="-")
-        self.summary_avg_var = tk.StringVar(value="-")
-        self.summary_hold_var = tk.StringVar(value="-")
-
-        self._build_ui()
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-
-        self.after(100, self.connect_and_start)
-
-    def _build_ui(self) -> None:
-        root = ttk.Frame(self, padding=12)
-        root.pack(fill="both", expand=True)
-
-        top = ttk.LabelFrame(root, text="Управление", padding=10)
-        top.pack(fill="x")
-
-        ttk.Label(top, text="Timeframe").grid(row=0, column=0, sticky="w")
-        timeframe_box = ttk.Combobox(
-            top,
-            textvariable=self.timeframe_var,
-            values=list(TIMEFRAME_BARS_PER_DAY.keys()),
-            state="readonly",
-            width=8,
-        )
-        timeframe_box.grid(row=0, column=1, padx=(6, 12), sticky="w")
-
-        ttk.Label(top, text="Дней для теста").grid(row=0, column=2, sticky="w")
-        ttk.Entry(top, textvariable=self.days_var, width=8).grid(row=0, column=3, padx=(6, 12), sticky="w")
-
-        ttk.Label(top, text="Refresh ms").grid(row=0, column=4, sticky="w")
-        ttk.Entry(top, textvariable=self.refresh_ms_var, width=8).grid(row=0, column=5, padx=(6, 12), sticky="w")
-
-        ttk.Checkbutton(top, text="Auto refresh", variable=self.auto_refresh_var, command=self.on_toggle_refresh).grid(
-            row=0, column=6, padx=(6, 12), sticky="w"
-        )
-
-        ttk.Button(top, text="Обновить live", command=self.refresh_live).grid(row=0, column=7, padx=(6, 6), sticky="w")
-        ttk.Button(top, text="Запустить тест", command=self.run_backtest).grid(row=0, column=8, padx=(6, 6), sticky="w")
-        ttk.Button(top, text="Переподключить MT5", command=self.reconnect).grid(row=0, column=9, padx=(6, 6), sticky="w")
-
-        info = ttk.LabelFrame(root, text="Статус", padding=10)
-        info.pack(fill="x", pady=(10, 0))
-        info.columnconfigure(1, weight=1)
-
-        self._kv(info, 0, 0, "Статус", self.status_var)
-        self._kv(info, 0, 2, "Аккаунт", self.account_var)
-        self._kv(info, 0, 4, "Время бара", self.time_var)
-
-        live = ttk.LabelFrame(root, text="Live", padding=10)
-        live.pack(fill="x", pady=(10, 0))
-
-        self._kv(live, 0, 0, self.base_cfg.symbol_leg_1, self.price_1_var)
-        self._kv(live, 0, 2, self.base_cfg.symbol_leg_2, self.price_2_var)
-        self._kv(live, 0, 4, f"{self.base_cfg.symbol_leg_1} spread pips", self.tick_spread_1_var)
-        self._kv(live, 0, 6, f"{self.base_cfg.symbol_leg_2} spread pips", self.tick_spread_2_var)
-
-        self._kv(live, 1, 0, "Synthetic ratio", self.synth_var)
-        self._kv(live, 1, 2, "beta", self.beta_var)
-        self._kv(live, 1, 4, "corr", self.corr_var)
-        self._kv(live, 1, 6, "state", self.live_state_var)
-
-        self._kv(live, 2, 0, "spread raw", self.spread_raw_var)
-        self._kv(live, 2, 2, "spread z", self.spread_z_var)
-        self._kv(live, 2, 4, "resid z", self.resid_z_var)
-        self._kv(live, 2, 6, "combo z", self.combo_z_var)
-
-        bt = ttk.LabelFrame(root, text="Результат теста", padding=10)
-        bt.pack(fill="x", pady=(10, 0))
-
-        self._kv(bt, 0, 0, "trades", self.summary_trades_var)
-        self._kv(bt, 0, 2, "win rate", self.summary_winrate_var)
-        self._kv(bt, 0, 4, "gross pnl usd", self.summary_gross_var)
-        self._kv(bt, 0, 6, "net pnl usd", self.summary_net_var)
-
-        self._kv(bt, 1, 0, "avg net pnl usd", self.summary_avg_var)
-        self._kv(bt, 1, 2, "median hold bars", self.summary_hold_var)
-
-        bottom = ttk.Panedwindow(root, orient="horizontal")
-        bottom.pack(fill="both", expand=True, pady=(10, 0))
-
-        left_frame = ttk.LabelFrame(bottom, text="Последние сделки", padding=8)
-        right_frame = ttk.LabelFrame(bottom, text="Лог", padding=8)
-        bottom.add(left_frame, weight=3)
-        bottom.add(right_frame, weight=2)
-
-        columns = ("entry_time", "side", "combo_z", "hold_bars", "reason", "net_pnl_usd")
-        self.trades_table = ttk.Treeview(left_frame, columns=columns, show="headings", height=18)
-        self.trades_table.pack(fill="both", expand=True)
-
-        headers = {
-            "entry_time": "entry_time",
-            "side": "side",
-            "combo_z": "combo_z",
-            "hold_bars": "hold",
-            "reason": "reason",
-            "net_pnl_usd": "net_pnl_usd",
-        }
-        widths = {
-            "entry_time": 180,
-            "side": 60,
-            "combo_z": 90,
-            "hold_bars": 60,
-            "reason": 80,
-            "net_pnl_usd": 100,
-        }
-        for col in columns:
-            self.trades_table.heading(col, text=headers[col])
-            self.trades_table.column(col, width=widths[col], anchor="center")
-
-        self.log = tk.Text(right_frame, height=18, wrap="word")
-        self.log.pack(fill="both", expand=True)
-
-    def _kv(self, parent: ttk.Widget, row: int, col: int, key: str, var: tk.StringVar) -> None:
-        ttk.Label(parent, text=key).grid(row=row, column=col, sticky="w", padx=(0, 6), pady=4)
-        ttk.Label(parent, textvariable=var).grid(row=row, column=col + 1, sticky="w", padx=(0, 18), pady=4)
-
-    def log_line(self, text: str) -> None:
-        now = datetime.now().strftime("%H:%M:%S")
-        self.log.insert("end", f"[{now}] {text}\n")
-        self.log.see("end")
-
-    def current_cfg(self):
-        timeframe = self.timeframe_var.get().strip() or self.base_cfg.timeframe
-        if timeframe not in TIMEFRAME_BARS_PER_DAY:
-            raise RuntimeError(f"unsupported timeframe: {timeframe}")
-
-        days = max(1, int(self.days_var.get().strip() or "2"))
-        bars = max(days * TIMEFRAME_BARS_PER_DAY[timeframe], self.base_cfg.min_warmup_bars * 2)
-
-        cfg = replace(self.base_cfg, timeframe=timeframe, history_bars=bars)
-        return cfg, days, bars
-
-    def connect_and_start(self) -> None:
-        try:
-            if self.is_connected:
-                return
-            self.client.connect()
-            self.meta_1 = self.client.symbol_meta(self.base_cfg.symbol_leg_1)
-            self.meta_2 = self.client.symbol_meta(self.base_cfg.symbol_leg_2)
-            self.is_connected = True
-            self.status_var.set("connected")
-            self.account_var.set(f"{self.base_cfg.mt5_login} @ {self.base_cfg.mt5_server}")
-            self.log_line("MT5 connected")
-            self.refresh_live()
-        except Exception as exc:
-            self.status_var.set("connect_error")
-            self.log_line(f"MT5 connect error: {exc}")
-            messagebox.showerror("MT5", str(exc))
-
-    def reconnect(self) -> None:
-        try:
-            self.stop_refresh()
-            if self.is_connected:
-                self.client.shutdown()
-                self.is_connected = False
-            self.client = MT5Client(self.base_cfg)
-            self.connect_and_start()
-        except Exception as exc:
-            self.status_var.set("reconnect_error")
-            self.log_line(f"Reconnect error: {exc}")
-            messagebox.showerror("Reconnect", str(exc))
-
-    def stop_refresh(self) -> None:
-        if self.live_job is not None:
-            self.after_cancel(self.live_job)
-            self.live_job = None
-
-    def on_toggle_refresh(self) -> None:
-        if self.auto_refresh_var.get():
-            self.refresh_live()
-        else:
-            self.stop_refresh()
-
-    def schedule_next(self) -> None:
-        self.stop_refresh()
-        if self.auto_refresh_var.get():
-            delay = max(500, int(self.refresh_ms_var.get().strip() or "1000"))
-            self.live_job = self.after(delay, self.refresh_live)
-
-    def _tick_spread_pips(self, symbol: str, digits: int) -> tuple[float, float, float]:
-        tick = self.client.tick(symbol)
-        bid = float(tick["bid"])
-        ask = float(tick["ask"])
-        spread = (ask - bid) / pip_size(digits)
-        mid = (ask + bid) / 2.0
-        return bid, ask, spread if spread >= 0 else 0.0, mid
-
-    def refresh_live(self) -> None:
-        try:
-            if not self.is_connected:
-                self.connect_and_start()
-                return
-
-            cfg, _, _ = self.current_cfg()
-            raw = load_pair_history(self.client, cfg.symbol_leg_1, cfg.symbol_leg_2, cfg.timeframe, cfg.history_bars)
-            feat = build_feature_frame(raw, cfg)
-            if feat.empty:
-                self.log_line("No features yet")
-                self.schedule_next()
-                return
-
-            row = feat.iloc[-1]
-            trades = simulate_trades(feat, cfg, self.meta_1, self.meta_2)
-            live = estimate_live_edge(feat, trades, cfg) or {}
-
-            bid_1, ask_1, spread_1, mid_1 = self._tick_spread_pips(cfg.symbol_leg_1, self.meta_1.digits)
-            bid_2, ask_2, spread_2, mid_2 = self._tick_spread_pips(cfg.symbol_leg_2, self.meta_2.digits)
-
-            self.time_var.set(str(row["time"]))
-            self.price_1_var.set(f"bid {bid_1:.5f} | ask {ask_1:.5f}")
-            self.price_2_var.set(f"bid {bid_2:.5f} | ask {ask_2:.5f}")
-            self.tick_spread_1_var.set(f"{spread_1:.2f}")
-            self.tick_spread_2_var.set(f"{spread_2:.2f}")
-            self.synth_var.set(f"{(mid_1 / mid_2):.6f}" if mid_2 else "-")
-
-            self.beta_var.set(self._fmt(row["beta"]))
-            self.corr_var.set(self._fmt(row["corr"]))
-            self.spread_raw_var.set(self._fmt(row["spread_raw"], 6))
-            self.spread_z_var.set(self._fmt(row["spread_z"]))
-            self.resid_z_var.set(self._fmt(row["resid_z"]))
-            self.combo_z_var.set(self._fmt(row["combo_z"]))
-            self.live_state_var.set(str(live.get("status", "-")))
-
-            self.status_var.set("connected")
-            self.log_line(
-                f"live status={live.get('status')} combo_z={self._fmt(row['combo_z'])} "
-                f"spread_z={self._fmt(row['spread_z'])} resid_z={self._fmt(row['resid_z'])} "
-                f"corr={self._fmt(row['corr'])} beta={self._fmt(row['beta'])}"
-            )
-        except Exception as exc:
-            self.status_var.set("live_error")
-            self.log_line(f"Live refresh error: {exc}")
-        finally:
-            self.schedule_next()
-
-    def run_backtest(self) -> None:
-        try:
-            if not self.is_connected:
-                self.connect_and_start()
-                if not self.is_connected:
-                    return
-
-            cfg, days, bars = self.current_cfg()
-            raw = load_pair_history(self.client, cfg.symbol_leg_1, cfg.symbol_leg_2, cfg.timeframe, bars)
-            feat = build_feature_frame(raw, cfg)
-            trades = simulate_trades(feat, cfg, self.meta_1, self.meta_2)
-            summary = summarize_trades(trades)
-            live = estimate_live_edge(feat, trades, cfg) or {}
-
-            self.summary_trades_var.set(self._fmt(summary.get("trades", 0), 0))
-            self.summary_winrate_var.set(self._fmt_pct(summary.get("win_rate", 0.0)))
-            self.summary_gross_var.set(self._fmt(summary.get("gross_pnl_usd", 0.0)))
-            self.summary_net_var.set(self._fmt(summary.get("net_pnl_usd", 0.0)))
-            self.summary_avg_var.set(self._fmt(summary.get("avg_net_pnl_usd", 0.0)))
-            self.summary_hold_var.set(self._fmt(summary.get("median_hold_bars", 0.0), 0))
-
-            self.fill_trades_table(trades.tail(30))
-            self.log_line(
-                f"backtest done timeframe={cfg.timeframe} days={days} bars={bars} "
-                f"trades={summary.get('trades', 0)} net={self._fmt(summary.get('net_pnl_usd', 0.0))} "
-                f"live={live.get('status')}"
-            )
-        except Exception as exc:
-            self.log_line(f"Backtest error: {exc}")
-            messagebox.showerror("Backtest", str(exc))
-
-    def fill_trades_table(self, trades: pd.DataFrame) -> None:
-        for item in self.trades_table.get_children():
-            self.trades_table.delete(item)
-
-        if trades.empty:
-            return
-
-        for _, row in trades.iterrows():
-            side_text = "LONG1/SHORT2" if int(row["side"]) == 1 else "SHORT1/LONG2"
-            self.trades_table.insert(
-                "",
-                "end",
-                values=(
-                    str(row["entry_time"]),
-                    side_text,
-                    self._fmt(row["combo_z"]),
-                    int(row["hold_bars"]),
-                    str(row["reason"]),
-                    self._fmt(row["net_pnl_usd"]),
-                ),
-            )
-
-    def _fmt(self, value: float | int | None, digits: int = 4) -> str:
-        if value is None:
-            return "-"
-        try:
-            val = float(value)
-        except Exception:
-            return str(value)
-        if math.isnan(val) or math.isinf(val):
-            return "-"
-        if digits == 0:
-            return str(int(round(val)))
-        return f"{val:.{digits}f}"
-
-    def _fmt_pct(self, value: float | int | None) -> str:
-        if value is None:
-            return "-"
-        try:
-            val = float(value)
-        except Exception:
-            return str(value)
-        if math.isnan(val) or math.isinf(val):
-            return "-"
-        return f"{val * 100:.2f}%"
-
-    def on_close(self) -> None:
-        try:
-            self.stop_refresh()
-            if self.is_connected:
-                self.client.shutdown()
-        finally:
-            self.destroy()
-
-
-def main() -> None:
-    app = App()
-    app.mainloop()
-
-
-if __name__ == "__main__":
-    main()
-
 # src/app/ui_relative_compare/__init__.py
 
 # src/app/ui_relative_compare/__init__.py
@@ -2667,21 +2174,27 @@ def build_render_snapshot(
 # src/app/ui_relative_compare/services/trading.py
 # src/app/ui_relative_compare/services/trading.py
 # Sends opposite market orders for an explicitly selected symbol direction,
-# and closes all positions for the selected pair with PnL summary.
+# closes all positions for the selected pair with PnL summary from actual MT5 deal history,
+# and can reverse the whole pair in one action.
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import time
 
 import MetaTrader5 as mt5
 
 from src.broker.mt5_client import MT5Client
 from src.common.settings import Settings
-from src.strategy.costs import commission_usd_per_lot_one_way
 
 
 CLIENT_DISABLES_AT = 10027
 MIN_ORDER_LOTS = 0.01
+
+DEAL_ENTRY_OUT = int(getattr(mt5, "DEAL_ENTRY_OUT", 1))
+DEAL_ENTRY_OUT_BY = int(getattr(mt5, "DEAL_ENTRY_OUT_BY", 3))
+DEAL_ENTRY_INOUT = int(getattr(mt5, "DEAL_ENTRY_INOUT", 2))
+CLOSE_ENTRIES = {DEAL_ENTRY_OUT, DEAL_ENTRY_OUT_BY, DEAL_ENTRY_INOUT}
 
 
 @dataclass(slots=True)
@@ -2697,8 +2210,27 @@ class OrderSendSummary:
 @dataclass(slots=True)
 class ClosePairSummary:
     closed_count: int
-    gross_pnl_usd: float
-    net_pnl_est_usd: float
+    deals_count: int
+    profit_usd: float
+    commission_usd: float
+    swap_usd: float
+    fee_usd: float
+    total_pnl_usd: float
+
+
+@dataclass(slots=True)
+class ReopenedLeg:
+    symbol: str
+    side: str
+    volume: float
+    retcode: int
+    order: int
+
+
+@dataclass(slots=True)
+class ReversePairSummary:
+    close_summary: ClosePairSummary
+    reopened_legs: list[ReopenedLeg]
 
 
 def _terminal_flags() -> dict:
@@ -2915,11 +2447,110 @@ def _symbol_positions(symbol: str) -> list:
     return list(items or [])
 
 
-def _estimated_round_turn_commission_usd(symbol: str, volume: float, cfg: Settings) -> float:
-    rate = commission_usd_per_lot_one_way(symbol, cfg)
-    if rate is None:
-        return 0.0
-    return float(rate) * float(volume) * cfg.round_turn_multiplier
+def _position_is_closed(ticket: int) -> bool:
+    items = mt5.positions_get(ticket=int(ticket))
+    return not items
+
+
+def _position_deals(ticket: int) -> list:
+    deals = mt5.history_deals_get(position=int(ticket))
+    return list(deals or [])
+
+
+def _has_close_deal(deals: list) -> bool:
+    for deal in deals:
+        entry = int(getattr(deal, "entry", -1))
+        if entry in CLOSE_ENTRIES:
+            return True
+    return False
+
+
+def _wait_closed_position_deals(ticket: int, timeout_sec: float = 10.0, sleep_sec: float = 0.2) -> list:
+    deadline = time.time() + timeout_sec
+    last_deals: list = []
+
+    while time.time() < deadline:
+        closed = _position_is_closed(ticket)
+        deals = _position_deals(ticket)
+
+        if deals:
+            last_deals = deals
+            if _has_close_deal(deals):
+                return deals
+
+        if closed and deals:
+            return deals
+
+        time.sleep(sleep_sec)
+
+    return last_deals
+
+
+def _sum_deals(deals: list) -> tuple[float, float, float, float]:
+    profit_usd = 0.0
+    commission_usd = 0.0
+    swap_usd = 0.0
+    fee_usd = 0.0
+
+    for deal in deals:
+        profit_usd += float(getattr(deal, "profit", 0.0) or 0.0)
+        commission_usd += float(getattr(deal, "commission", 0.0) or 0.0)
+        swap_usd += float(getattr(deal, "swap", 0.0) or 0.0)
+        fee_usd += float(getattr(deal, "fee", 0.0) or 0.0)
+
+    return profit_usd, commission_usd, swap_usd, fee_usd
+
+
+def _build_reverse_legs_from_positions(positions: list) -> list[tuple[str, str, float]]:
+    aggregated: dict[tuple[str, str], float] = {}
+
+    for position in positions:
+        symbol = str(position.symbol)
+        volume = float(getattr(position, "volume", 0.0) or 0.0)
+        if volume <= 0:
+            continue
+
+        current_type = int(getattr(position, "type", -1))
+        reverse_side = "sell" if current_type == mt5.ORDER_TYPE_BUY else "buy"
+
+        key = (symbol, reverse_side)
+        aggregated[key] = aggregated.get(key, 0.0) + volume
+
+    legs: list[tuple[str, str, float]] = []
+    for (symbol, side), volume in sorted(aggregated.items(), key=lambda item: (0 if item[0][1] == "sell" else 1, item[0][0])):
+        if volume > 0:
+            legs.append((symbol, side, float(volume)))
+
+    return legs
+
+
+def _open_leg(
+    client: MT5Client,
+    cfg: Settings,
+    symbol: str,
+    side: str,
+    volume: float,
+    deviation: int,
+) -> ReopenedLeg:
+    client.ensure_symbol(symbol)
+    normalized_volume = _normalize_volume(volume, symbol)
+
+    result = _send_market_with_fill_fallback(
+        symbol=symbol,
+        volume=normalized_volume,
+        side=side,
+        deviation=deviation,
+        magic=cfg.mt5_magic,
+        comment="relative_compare_reverse",
+    )
+
+    return ReopenedLeg(
+        symbol=symbol,
+        side=side,
+        volume=normalized_volume,
+        retcode=int(result.retcode),
+        order=int(getattr(result, "order", 0) or 0),
+    )
 
 
 def open_pair_positions(
@@ -2978,34 +2609,122 @@ def close_pair_positions(
 
     positions = [*_symbol_positions(symbol_1), *_symbol_positions(symbol_2)]
     if not positions:
-        return ClosePairSummary(closed_count=0, gross_pnl_usd=0.0, net_pnl_est_usd=0.0)
-
-    gross_pnl_usd = 0.0
-    commission_est_usd = 0.0
-
-    for position in positions:
-        gross_pnl_usd += float(getattr(position, "profit", 0.0) or 0.0)
-        gross_pnl_usd += float(getattr(position, "swap", 0.0) or 0.0)
-        commission_est_usd += _estimated_round_turn_commission_usd(str(position.symbol), float(position.volume), cfg)
+        return ClosePairSummary(
+            closed_count=0,
+            deals_count=0,
+            profit_usd=0.0,
+            commission_usd=0.0,
+            swap_usd=0.0,
+            fee_usd=0.0,
+            total_pnl_usd=0.0,
+        )
 
     errors: list[str] = []
     closed_count = 0
+    closed_tickets: list[int] = []
 
     for position in positions:
         try:
             client.ensure_symbol(str(position.symbol))
             _close_position_with_fill_fallback(position, deviation=deviation, magic=cfg.mt5_magic)
             closed_count += 1
+            closed_tickets.append(int(position.ticket))
         except Exception as exc:
             errors.append(str(exc))
 
     if errors:
         raise RuntimeError("\n".join(errors))
 
+    all_deals: list = []
+    missing_tickets: list[int] = []
+
+    for ticket in closed_tickets:
+        deals = _wait_closed_position_deals(ticket)
+        if not deals:
+            missing_tickets.append(ticket)
+            continue
+        all_deals.extend(deals)
+
+    if missing_tickets:
+        missing_text = ", ".join(str(ticket) for ticket in missing_tickets)
+        raise RuntimeError(
+            "Позиции закрыты, но MT5 пока не отдал историю сделок по position_id: "
+            f"{missing_text}. Повтори через 1-2 секунды."
+        )
+
+    profit_usd, commission_usd, swap_usd, fee_usd = _sum_deals(all_deals)
+    total_pnl_usd = profit_usd + commission_usd + swap_usd + fee_usd
+
     return ClosePairSummary(
         closed_count=closed_count,
-        gross_pnl_usd=float(gross_pnl_usd),
-        net_pnl_est_usd=float(gross_pnl_usd - commission_est_usd),
+        deals_count=len(all_deals),
+        profit_usd=float(profit_usd),
+        commission_usd=float(commission_usd),
+        swap_usd=float(swap_usd),
+        fee_usd=float(fee_usd),
+        total_pnl_usd=float(total_pnl_usd),
+    )
+
+
+def reverse_pair_positions(
+    client: MT5Client,
+    cfg: Settings,
+    symbol_1: str,
+    symbol_2: str,
+    deviation: int = 20,
+) -> ReversePairSummary:
+    _ensure_python_trading_enabled()
+
+    positions = [*_symbol_positions(symbol_1), *_symbol_positions(symbol_2)]
+    if not positions:
+        raise RuntimeError("Нет открытых позиций по текущей связке для разворота")
+
+    reverse_legs = _build_reverse_legs_from_positions(positions)
+    if not reverse_legs:
+        raise RuntimeError("Не удалось построить обратные позиции для разворота")
+
+    close_summary = close_pair_positions(
+        client=client,
+        cfg=cfg,
+        symbol_1=symbol_1,
+        symbol_2=symbol_2,
+        deviation=deviation,
+    )
+
+    reopened_legs: list[ReopenedLeg] = []
+    errors: list[str] = []
+
+    for symbol, side, volume in reverse_legs:
+        try:
+            reopened_legs.append(
+                _open_leg(
+                    client=client,
+                    cfg=cfg,
+                    symbol=symbol,
+                    side=side,
+                    volume=volume,
+                    deviation=deviation,
+                )
+            )
+        except Exception as exc:
+            errors.append(f"{side.upper()} {symbol} {volume:.2f}: {exc}")
+
+    if errors:
+        opened_text = "\n".join(
+            f"{leg.side.upper()} {leg.symbol} {leg.volume:.2f} order={leg.order} retcode={leg.retcode}"
+            for leg in reopened_legs
+        )
+        parts = ["Позиции закрыты, но разворот открыт не полностью."]
+        if opened_text:
+            parts.append("Уже открыто:")
+            parts.append(opened_text)
+        parts.append("Ошибки:")
+        parts.append("\n".join(errors))
+        raise RuntimeError("\n".join(parts))
+
+    return ReversePairSummary(
+        close_summary=close_summary,
+        reopened_legs=reopened_legs,
     )
 
 # src/app/ui_relative_compare/services/ui_state.py
@@ -3104,7 +2823,7 @@ from src.app.ui_relative_compare.services.market import (
     calculate_relative_metrics,
     load_two_symbols,
 )
-from src.app.ui_relative_compare.services.trading import close_pair_positions, open_pair_positions
+from src.app.ui_relative_compare.services.trading import close_pair_positions, open_pair_positions, reverse_pair_positions
 from src.app.ui_relative_compare.services.ui_state import UIState, load_ui_state, save_ui_state
 from src.app.ui_relative_compare.ui.chart import RelativeChart
 from src.broker.mt5_client import MT5Client
@@ -3295,7 +3014,8 @@ class RelativeCompareUI(tk.Tk):
                 "Нажатие на кнопку всегда открывает противоположную позицию по второй паре. "
                 "Галочка 'Объем автоматически' оставляет текущую логику расчета объема. "
                 "При отключении можно задать объем отдельно для каждой пары вручную. "
-                "Кнопка 'Закрыть все' закрывает все позиции по двум выбранным символам."
+                "Кнопка 'Закрыть все' закрывает все позиции по двум выбранным символам. "
+                "Кнопка 'Развернуть' одновременно закрывает все позиции и открывает их в обратную сторону."
             ),
             wraplength=1300,
         ).pack(anchor="w")
@@ -3348,7 +3068,8 @@ class RelativeCompareUI(tk.Tk):
         self._make_px_button(header_inner, "SELL", lambda: self.open_direct_order(2, "sell"), 60, 25).pack(side="left", padx=(0, 4))
         self._make_px_button(header_inner, "BUY", lambda: self.open_direct_order(2, "buy"), 60, 25).pack(side="left", padx=(0, 16))
 
-        self._make_px_button(header_inner, "ЗАКРЫТЬ ВСЕ", self.close_current_pair_positions, 110, 25).pack(side="left")
+        self._make_px_button(header_inner, "ЗАКРЫТЬ ВСЕ", self.close_current_pair_positions, 110, 25).pack(side="left", padx=(0, 8))
+        self._make_px_button(header_inner, "РАЗВЕРНУТЬ", self.reverse_current_pair_positions, 110, 25).pack(side="left")
 
         self.candle_canvas = tk.Canvas(charts_right, bg="#111111", highlightthickness=0)
         self.candle_canvas.grid(row=1, column=0, sticky="nsew")
@@ -3977,8 +3698,12 @@ class RelativeCompareUI(tk.Tk):
                 (
                     f"Связка: {symbol_1} / {symbol_2}\n"
                     f"Закрыто позиций: {summary.closed_count}\n"
-                    f"gross+swap pnl usd: {summary.gross_pnl_usd:.2f}\n"
-                    f"net est pnl usd: {summary.net_pnl_est_usd:.2f}"
+                    f"Сделок MT: {summary.deals_count}\n"
+                    f"MT profit: {summary.profit_usd:.2f}\n"
+                    f"MT commission: {summary.commission_usd:.2f}\n"
+                    f"MT swap: {summary.swap_usd:.2f}\n"
+                    f"MT fee: {summary.fee_usd:.2f}\n"
+                    f"MT total pnl: {summary.total_pnl_usd:.2f}"
                 ),
             )
             if self.current_snapshot is not None:
@@ -3986,6 +3711,40 @@ class RelativeCompareUI(tk.Tk):
         except Exception as exc:
             self.status_var.set("close_error")
             messagebox.showerror("Закрытие позиций по связке", str(exc))
+
+    def reverse_current_pair_positions(self) -> None:
+        try:
+            self._ensure_connected()
+            assert self.client is not None
+
+            symbol_1, symbol_2, _, _, _, _, _ = self._read_inputs()
+            summary = reverse_pair_positions(self.client, self.base_cfg, symbol_1, symbol_2)
+            self.status_var.set("positions_reversed")
+
+            reopened_lines = []
+            for leg in summary.reopened_legs:
+                reopened_lines.append(
+                    f"{leg.side.upper()} {leg.symbol} {leg.volume:.2f} "
+                    f"order={leg.order} retcode={leg.retcode}"
+                )
+
+            messagebox.showinfo(
+                "Позиции развернуты",
+                (
+                    f"Связка: {symbol_1} / {symbol_2}\n"
+                    f"Закрыто позиций: {summary.close_summary.closed_count}\n"
+                    f"Сделок MT: {summary.close_summary.deals_count}\n"
+                    f"MT total pnl: {summary.close_summary.total_pnl_usd:.2f}\n\n"
+                    f"Открыто в обратную сторону:\n"
+                    + "\n".join(reopened_lines)
+                ),
+            )
+
+            if self.current_snapshot is not None:
+                self.render_once()
+        except Exception as exc:
+            self.status_var.set("reverse_error")
+            messagebox.showerror("Разворот позиций по связке", str(exc))
 
     def start_live(self) -> None:
         try:
@@ -4738,700 +4497,3 @@ class RelativeChart:
             outline=color,
             fill=color,
         )
-
-# src/broker/__init__.py
-# src/broker/__init__.py
-# Broker adapters.
-
-# src/broker/mt5_client.py
-# src/broker/mt5_client.py
-# Thin MT5 wrapper for account, symbols, bars, and ticks.
-from __future__ import annotations
-
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
-
-import MetaTrader5 as mt5
-import pandas as pd
-
-from src.common.settings import Settings
-
-
-TIMEFRAMES = {
-    "M1": mt5.TIMEFRAME_M1,
-    "M5": mt5.TIMEFRAME_M5,
-    "M15": mt5.TIMEFRAME_M15,
-    "H1": mt5.TIMEFRAME_H1,
-}
-
-
-@dataclass(slots=True)
-class SymbolMeta:
-    symbol: str
-    digits: int
-    point: float
-    contract_size: float
-    volume_min: float
-    volume_step: float
-    tick_size: float
-    tick_value: float
-    swap_long: float
-    swap_short: float
-
-
-class MT5Client:
-    def __init__(self, settings: Settings) -> None:
-        self.settings = settings
-
-    def _normalize_terminal_path(self) -> str | None:
-        raw = (self.settings.mt5_terminal_path or "").strip().strip('"').strip("'")
-        if not raw:
-            return None
-
-        path = Path(raw)
-
-        if path.is_dir():
-            for name in ("terminal64.exe", "terminal.exe", "metatrader64.exe", "metatrader.exe"):
-                candidate = path / name
-                if candidate.exists():
-                    return str(candidate)
-            raise RuntimeError(
-                f"MT5_TERMINAL_PATH points to a directory, but no terminal EXE was found inside: {path}"
-            )
-
-        if not path.exists():
-            raise RuntimeError(f"MT5 terminal path does not exist: {path}")
-
-        return str(path)
-
-    def connect(self) -> None:
-        terminal_path = self._normalize_terminal_path()
-
-        init_kwargs: dict[str, Any] = {
-            "timeout": self.settings.mt5_timeout_ms,
-            "portable": self.settings.mt5_portable,
-        }
-        if terminal_path:
-            init_kwargs["path"] = terminal_path
-
-        ok = mt5.initialize(**init_kwargs)
-        if not ok:
-            raise RuntimeError(f"mt5.initialize failed: {mt5.last_error()}")
-
-        if self.settings.mt5_login > 0:
-            ok = mt5.login(
-                int(self.settings.mt5_login),
-                password=self.settings.mt5_password,
-                server=self.settings.mt5_server,
-                timeout=self.settings.mt5_timeout_ms,
-            )
-            if not ok:
-                raise RuntimeError(f"mt5.login failed: {mt5.last_error()}")
-
-        account = mt5.account_info()
-        if account is None:
-            raise RuntimeError(f"mt5.account_info failed after login: {mt5.last_error()}")
-
-    def shutdown(self) -> None:
-        mt5.shutdown()
-
-    def ensure_symbol(self, symbol: str) -> None:
-        info = mt5.symbol_info(symbol)
-        if info is None:
-            raise RuntimeError(f"symbol not found: {symbol}")
-        if not info.visible and not mt5.symbol_select(symbol, True):
-            raise RuntimeError(f"symbol_select failed: {symbol}")
-
-    def symbol_meta(self, symbol: str) -> SymbolMeta:
-        self.ensure_symbol(symbol)
-        info = mt5.symbol_info(symbol)
-        if info is None:
-            raise RuntimeError(f"symbol_info failed: {symbol}")
-        return SymbolMeta(
-            symbol=symbol,
-            digits=info.digits,
-            point=info.point,
-            contract_size=info.trade_contract_size,
-            volume_min=info.volume_min,
-            volume_step=info.volume_step,
-            tick_size=info.trade_tick_size,
-            tick_value=info.trade_tick_value,
-            swap_long=info.swap_long,
-            swap_short=info.swap_short,
-        )
-
-    def copy_rates(self, symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
-        self.ensure_symbol(symbol)
-        if timeframe not in TIMEFRAMES:
-            raise RuntimeError(f"unsupported timeframe: {timeframe}")
-
-        rates = mt5.copy_rates_from_pos(symbol, TIMEFRAMES[timeframe], 0, bars)
-        if rates is None:
-            raise RuntimeError(f"copy_rates_from_pos failed for {symbol}: {mt5.last_error()}")
-
-        frame = pd.DataFrame(rates)
-        if frame.empty:
-            raise RuntimeError(f"no rates returned for {symbol}")
-
-        frame["time"] = pd.to_datetime(frame["time"], unit="s", utc=True)
-        return frame
-
-    def tick(self, symbol: str) -> dict[str, Any]:
-        self.ensure_symbol(symbol)
-        tick = mt5.symbol_info_tick(symbol)
-        if tick is None:
-            raise RuntimeError(f"symbol_info_tick failed for {symbol}: {mt5.last_error()}")
-        return tick._asdict()
-
-# src/common/__init__.py
-# src/common/__init__.py
-# Shared helpers.
-
-# src/common/logging.py
-# src/common/logging.py
-# Builds a compact console logger.
-from __future__ import annotations
-
-import logging
-
-
-def get_logger(name: str, level: str = "INFO") -> logging.Logger:
-    logger = logging.getLogger(name)
-    if logger.handlers:
-        return logger
-    logger.setLevel(level.upper())
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
-    logger.addHandler(handler)
-    logger.propagate = False
-    return logger
-
-# src/common/settings.py
-
-# src/common/settings.py
-# Reads environment variables into a typed settings object.
-from __future__ import annotations
-
-from dataclasses import dataclass
-from pathlib import Path
-import os
-
-from dotenv import load_dotenv
-
-
-load_dotenv()
-
-
-def _bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name, str(default)).strip().lower()
-    return raw in {"1", "true", "yes", "y", "on"}
-
-
-def _int(name: str, default: int) -> int:
-    return int(os.getenv(name, default))
-
-
-def _float(name: str, default: float) -> float:
-    return float(os.getenv(name, default))
-
-
-@dataclass(slots=True)
-class Settings:
-    app_env: str
-    account_ccy: str
-    mt5_login: int
-    mt5_password: str
-    mt5_server: str
-    mt5_terminal_path: str
-    mt5_timeout_ms: int
-    mt5_reconnect_sec: int
-    mt5_portable: bool
-    mt5_magic: int
-    symbol_leg_1: str
-    symbol_leg_2: str
-    timeframe: str
-    history_bars: int
-    min_warmup_bars: int
-    beta_window_bars: int
-    spread_z_window_bars: int
-    resid_z_window_bars: int
-    corr_window_bars: int
-    vol_window_bars: int
-    min_abs_corr: float
-    min_beta_abs: float
-    max_beta_abs: float
-    entry_z_spread: float
-    entry_z_resid: float
-    exit_z: float
-    stop_z: float
-    time_stop_bars: int
-    cooldown_bars: int
-    base_lot_eurusd: float
-    risk_per_trade_usd: float
-    max_gross_notional_usd: float
-    commission_usd_per_million: float
-    commission_eurusd_usd_per_lot_one_way: float
-    commission_audusd_usd_per_lot_one_way: float
-    eurusd_spread_pips_assumed: float
-    audusd_spread_pips_assumed: float
-    eurusd_spread_pips_max: float
-    audusd_spread_pips_max: float
-    slippage_pips_per_leg: float
-    round_turn_multiplier: float
-    include_swap: bool
-    live_poll_ms: int
-    max_tick_age_ms: int
-    log_level: str
-    log_dir: Path
-    data_dir: Path
-
-
-def load_settings() -> Settings:
-    return Settings(
-        app_env=os.getenv("APP_ENV", "dev"),
-        account_ccy=os.getenv("ACCOUNT_CCY", "USD"),
-        mt5_login=_int("MT5_LOGIN", 0),
-        mt5_password=os.getenv("MT5_PASSWORD", ""),
-        mt5_server=os.getenv("MT5_SERVER", ""),
-        mt5_terminal_path=os.getenv("MT5_TERMINAL_PATH", ""),
-        mt5_timeout_ms=_int("MT5_TIMEOUT_MS", 10000),
-        mt5_reconnect_sec=_int("MT5_RECONNECT_SEC", 5),
-        mt5_portable=_bool("MT5_PORTABLE", False),
-        mt5_magic=_int("MT5_MAGIC", 420001),
-        symbol_leg_1=os.getenv("SYMBOL_LEG_1", "EURUSD"),
-        symbol_leg_2=os.getenv("SYMBOL_LEG_2", "AUDUSD"),
-        timeframe=os.getenv("TIMEFRAME", "M1"),
-        history_bars=_int("HISTORY_BARS", 2880),
-        min_warmup_bars=_int("MIN_WARMUP_BARS", 720),
-        beta_window_bars=_int("BETA_WINDOW_BARS", 1440),
-        spread_z_window_bars=_int("SPREAD_Z_WINDOW_BARS", 1440),
-        resid_z_window_bars=_int("RESID_Z_WINDOW_BARS", 1440),
-        corr_window_bars=_int("CORR_WINDOW_BARS", 1440),
-        vol_window_bars=_int("VOL_WINDOW_BARS", 60),
-        min_abs_corr=_float("MIN_ABS_CORR", 0.30),
-        min_beta_abs=_float("MIN_BETA_ABS", 0.30),
-        max_beta_abs=_float("MAX_BETA_ABS", 2.50),
-        entry_z_spread=_float("ENTRY_Z_SPREAD", 2.00),
-        entry_z_resid=_float("ENTRY_Z_RESID", 2.00),
-        exit_z=_float("EXIT_Z", 0.50),
-        stop_z=_float("STOP_Z", 3.50),
-        time_stop_bars=_int("TIME_STOP_BARS", 30),
-        cooldown_bars=_int("COOLDOWN_BARS", 5),
-        base_lot_eurusd=_float("BASE_LOT_EURUSD", 0.10),
-        risk_per_trade_usd=_float("RISK_PER_TRADE_USD", 20.0),
-        max_gross_notional_usd=_float("MAX_GROSS_NOTIONAL_USD", 50000),
-        commission_usd_per_million=_float("COMMISSION_USD_PER_MILLION", 20.0),
-        commission_eurusd_usd_per_lot_one_way=_float("COMMISSION_EURUSD_USD_PER_LOT_ONE_WAY", 2.4),
-        commission_audusd_usd_per_lot_one_way=_float("COMMISSION_AUDUSD_USD_PER_LOT_ONE_WAY", 1.5),
-        eurusd_spread_pips_assumed=_float("EURUSD_SPREAD_PIPS_ASSUMED", 0.1),
-        audusd_spread_pips_assumed=_float("AUDUSD_SPREAD_PIPS_ASSUMED", 0.3),
-        eurusd_spread_pips_max=_float("EURUSD_SPREAD_PIPS_MAX", 1.0),
-        audusd_spread_pips_max=_float("AUDUSD_SPREAD_PIPS_MAX", 1.2),
-        slippage_pips_per_leg=_float("SLIPPAGE_PIPS_PER_LEG", 0.2),
-        round_turn_multiplier=_float("ROUND_TURN_MULTIPLIER", 2.0),
-        include_swap=_bool("INCLUDE_SWAP", False),
-        live_poll_ms=_int("LIVE_POLL_MS", 250),
-        max_tick_age_ms=_int("MAX_TICK_AGE_MS", 1500),
-        log_level=os.getenv("LOG_LEVEL", "INFO"),
-        log_dir=Path(os.getenv("LOG_DIR", "./logs")),
-        data_dir=Path(os.getenv("DATA_DIR", "./data")),
-    )
-
-# src/data/__init__.py
-# src/data/__init__.py
-# Data loading helpers.
-
-# src/data/history.py
-# src/data/history.py
-# Loads and aligns bar history for both FX legs.
-from __future__ import annotations
-
-import pandas as pd
-
-from src.broker.mt5_client import MT5Client
-
-
-def load_pair_history(client: MT5Client, symbol_1: str, symbol_2: str, timeframe: str, bars: int) -> pd.DataFrame:
-    left = client.copy_rates(symbol_1, timeframe, bars)[["time", "close", "spread"]].rename(
-        columns={"close": "close_1", "spread": "bar_spread_1"}
-    )
-    right = client.copy_rates(symbol_2, timeframe, bars)[["time", "close", "spread"]].rename(
-        columns={"close": "close_2", "spread": "bar_spread_2"}
-    )
-    frame = left.merge(right, on="time", how="inner").sort_values("time").reset_index(drop=True)
-    return frame
-
-# src/strategy/__init__.py
-# src/strategy/__init__.py
-# Strategy modules.
-
-# src/strategy/costs.py
-
-# src/strategy/costs.py
-# Estimates round-turn trading costs for the two FX legs.
-from __future__ import annotations
-
-from dataclasses import dataclass
-
-from src.common.settings import Settings
-
-
-def pip_size(digits: int) -> float:
-    return 0.01 if digits in {2, 3} else 0.0001
-
-
-def pip_value_usd(contract_size: float, digits: int, lots: float) -> float:
-    return contract_size * pip_size(digits) * lots
-
-
-@dataclass(slots=True)
-class CostBreakdown:
-    lots_1: float
-    lots_2: float
-    spread_usd: float
-    commission_usd: float
-    slippage_usd: float
-    total_usd: float
-
-
-def hedge_lots(base_lot_1: float, beta: float, px_1: float, px_2: float) -> float:
-    ratio = abs(beta) * (px_1 / px_2)
-    return max(base_lot_1 * ratio, 0.0)
-
-
-def _symbol_key(symbol: str) -> str:
-    letters = "".join(ch for ch in symbol.upper() if "A" <= ch <= "Z")
-    return letters[:6]
-
-
-def commission_usd_per_lot_one_way(symbol: str, cfg: Settings) -> float | None:
-    key = _symbol_key(symbol)
-    if key == "EURUSD":
-        return cfg.commission_eurusd_usd_per_lot_one_way
-    if key == "AUDUSD":
-        return cfg.commission_audusd_usd_per_lot_one_way
-    return None
-
-
-def estimate_round_turn_cost(
-    cfg: Settings,
-    symbol_1: str,
-    symbol_2: str,
-    digits_1: int,
-    digits_2: int,
-    contract_size_1: float,
-    contract_size_2: float,
-    px_1: float,
-    px_2: float,
-    beta: float,
-    spread_pips_1: float,
-    spread_pips_2: float,
-) -> CostBreakdown:
-    lots_1 = cfg.base_lot_eurusd
-    lots_2 = hedge_lots(lots_1, beta, px_1, px_2)
-
-    spread_usd = (
-        pip_value_usd(contract_size_1, digits_1, lots_1) * spread_pips_1
-        + pip_value_usd(contract_size_2, digits_2, lots_2) * spread_pips_2
-    ) * cfg.round_turn_multiplier
-
-    rate_1 = commission_usd_per_lot_one_way(symbol_1, cfg)
-    rate_2 = commission_usd_per_lot_one_way(symbol_2, cfg)
-
-    if rate_1 is not None and rate_2 is not None:
-        commission_usd = (rate_1 * lots_1 + rate_2 * lots_2) * cfg.round_turn_multiplier
-    else:
-        notional_usd = px_1 * contract_size_1 * lots_1 + px_2 * contract_size_2 * lots_2
-        commission_usd = cfg.commission_usd_per_million * (notional_usd / 1_000_000.0) * cfg.round_turn_multiplier
-
-    slippage_usd = (
-        pip_value_usd(contract_size_1, digits_1, lots_1) * cfg.slippage_pips_per_leg
-        + pip_value_usd(contract_size_2, digits_2, lots_2) * cfg.slippage_pips_per_leg
-    ) * cfg.round_turn_multiplier
-
-    total_usd = spread_usd + commission_usd + slippage_usd
-    return CostBreakdown(lots_1, lots_2, spread_usd, commission_usd, slippage_usd, total_usd)
-
-# src/strategy/decision.py
-# src/strategy/decision.py
-# Applies entry filters and converts signal sign into leg directions.
-from __future__ import annotations
-
-import pandas as pd
-
-from src.common.settings import Settings
-
-
-def entry_side(row: pd.Series, cfg: Settings) -> int:
-    if abs(row["corr"]) < cfg.min_abs_corr:
-        return 0
-    if not (cfg.min_beta_abs <= abs(row["beta"]) <= cfg.max_beta_abs):
-        return 0
-    if abs(row["spread_z"]) < cfg.entry_z_spread:
-        return 0
-    if abs(row["resid_z"]) < cfg.entry_z_resid:
-        return 0
-    if pd.isna(row["combo_z"]):
-        return 0
-    return -1 if row["combo_z"] > 0 else 1
-
-
-def exit_hit(row: pd.Series, cfg: Settings) -> bool:
-    return abs(row["combo_z"]) <= cfg.exit_z
-
-
-def stop_hit(row: pd.Series, side: int, cfg: Settings) -> bool:
-    if pd.isna(row["combo_z"]):
-        return False
-    if side == 1 and row["combo_z"] <= -cfg.stop_z:
-        return True
-    if side == -1 and row["combo_z"] >= cfg.stop_z:
-        return True
-    return False
-
-# src/strategy/features.py
-# src/strategy/features.py
-# Computes rolling beta, spread, residual, and z-scores.
-from __future__ import annotations
-
-import numpy as np
-import pandas as pd
-
-from src.common.settings import Settings
-
-
-EPS = 1e-12
-
-
-def _rolling_z(series: pd.Series, window: int) -> pd.Series:
-    mean = series.rolling(window).mean()
-    std = series.rolling(window).std(ddof=0).replace(0, np.nan)
-    return (series - mean) / std
-
-
-def _rolling_beta(y: pd.Series, x: pd.Series, window: int) -> pd.Series:
-    cov = y.rolling(window).cov(x)
-    var = x.rolling(window).var().replace(0, np.nan)
-    return cov / var
-
-
-def build_feature_frame(frame: pd.DataFrame, cfg: Settings) -> pd.DataFrame:
-    out = frame.copy()
-    out["log_1"] = np.log(out["close_1"].clip(lower=EPS))
-    out["log_2"] = np.log(out["close_2"].clip(lower=EPS))
-    out["ret_1"] = out["log_1"].diff()
-    out["ret_2"] = out["log_2"].diff()
-    out["beta"] = _rolling_beta(out["ret_1"], out["ret_2"], cfg.beta_window_bars)
-    x_mean = out["ret_2"].rolling(cfg.beta_window_bars).mean()
-    y_mean = out["ret_1"].rolling(cfg.beta_window_bars).mean()
-    out["alpha"] = y_mean - out["beta"] * x_mean
-    out["corr"] = out["ret_1"].rolling(cfg.corr_window_bars).corr(out["ret_2"])
-    out["spread_raw"] = out["log_1"] - out["beta"] * out["log_2"]
-    out["spread_z"] = _rolling_z(out["spread_raw"], cfg.spread_z_window_bars)
-    out["resid_raw"] = out["ret_1"] - (out["alpha"] + out["beta"] * out["ret_2"])
-    out["resid_z"] = _rolling_z(out["resid_raw"], cfg.resid_z_window_bars)
-    same_sign = np.sign(out["spread_z"]) == np.sign(out["resid_z"])
-    out["combo_z"] = np.where(same_sign, (out["spread_z"] + out["resid_z"]) / 2.0, np.nan)
-    out["abs_combo_z"] = out["combo_z"].abs()
-    out["vol_1"] = out["ret_1"].rolling(cfg.vol_window_bars).std(ddof=0)
-    out["vol_2"] = out["ret_2"].rolling(cfg.vol_window_bars).std(ddof=0)
-    return out.dropna().reset_index(drop=True)
-
-# src/strategy/simulator.py
-
-# src/strategy/simulator.py
-# Runs a simple event-study and estimates current live edge.
-from __future__ import annotations
-
-from dataclasses import asdict
-
-import pandas as pd
-
-from src.broker.mt5_client import SymbolMeta
-from src.common.settings import Settings
-from src.strategy.costs import estimate_round_turn_cost
-from src.strategy.decision import entry_side, exit_hit, stop_hit
-
-
-def _gross_pnl_usd(
-    side: int,
-    entry_1: float,
-    entry_2: float,
-    exit_1: float,
-    exit_2: float,
-    lots_1: float,
-    lots_2: float,
-    cs_1: float,
-    cs_2: float,
-) -> float:
-    pnl_1 = side * (exit_1 - entry_1) * cs_1 * lots_1
-    pnl_2 = -side * (exit_2 - entry_2) * cs_2 * lots_2
-    return pnl_1 + pnl_2
-
-
-def simulate_trades(frame: pd.DataFrame, cfg: Settings, meta_1: SymbolMeta, meta_2: SymbolMeta) -> pd.DataFrame:
-    rows: list[dict] = []
-    i = 0
-    limit = len(frame) - 1
-
-    while i < limit:
-        row = frame.iloc[i]
-        side = entry_side(row, cfg)
-        if not side:
-            i += 1
-            continue
-
-        spread_1 = cfg.eurusd_spread_pips_assumed
-        spread_2 = cfg.audusd_spread_pips_assumed
-
-        costs = estimate_round_turn_cost(
-            cfg=cfg,
-            symbol_1=meta_1.symbol,
-            symbol_2=meta_2.symbol,
-            digits_1=meta_1.digits,
-            digits_2=meta_2.digits,
-            contract_size_1=meta_1.contract_size,
-            contract_size_2=meta_2.contract_size,
-            px_1=float(row["close_1"]),
-            px_2=float(row["close_2"]),
-            beta=float(row["beta"]),
-            spread_pips_1=spread_1,
-            spread_pips_2=spread_2,
-        )
-
-        entry_ix = i
-        exit_ix = min(i + cfg.time_stop_bars, limit)
-        reason = "time"
-
-        for j in range(i + 1, min(i + cfg.time_stop_bars, limit) + 1):
-            probe = frame.iloc[j]
-            if exit_hit(probe, cfg):
-                exit_ix = j
-                reason = "exit"
-                break
-            if stop_hit(probe, side, cfg):
-                exit_ix = j
-                reason = "stop"
-                break
-
-        exit_row = frame.iloc[exit_ix]
-
-        gross = _gross_pnl_usd(
-            side=side,
-            entry_1=float(row["close_1"]),
-            entry_2=float(row["close_2"]),
-            exit_1=float(exit_row["close_1"]),
-            exit_2=float(exit_row["close_2"]),
-            lots_1=costs.lots_1,
-            lots_2=costs.lots_2,
-            cs_1=meta_1.contract_size,
-            cs_2=meta_2.contract_size,
-        )
-
-        rows.append(
-            {
-                "entry_time": row["time"],
-                "exit_time": exit_row["time"],
-                "hold_bars": int(exit_ix - entry_ix),
-                "reason": reason,
-                "side": int(side),
-                "beta": float(row["beta"]),
-                "corr": float(row["corr"]),
-                "spread_z": float(row["spread_z"]),
-                "resid_z": float(row["resid_z"]),
-                "combo_z": float(row["combo_z"]),
-                "gross_pnl_usd": float(gross),
-                **{f"cost_{k}": v for k, v in asdict(costs).items()},
-                "net_pnl_usd": float(gross - costs.total_usd),
-            }
-        )
-
-        i = exit_ix + cfg.cooldown_bars
-
-    return pd.DataFrame(rows)
-
-
-def summarize_trades(trades: pd.DataFrame) -> dict[str, float]:
-    if trades.empty:
-        return {
-            "trades": 0.0,
-            "win_rate": 0.0,
-            "gross_pnl_usd": 0.0,
-            "net_pnl_usd": 0.0,
-        }
-
-    return {
-        "trades": float(len(trades)),
-        "win_rate": float((trades["net_pnl_usd"] > 0).mean()),
-        "gross_pnl_usd": float(trades["gross_pnl_usd"].sum()),
-        "net_pnl_usd": float(trades["net_pnl_usd"].sum()),
-        "avg_net_pnl_usd": float(trades["net_pnl_usd"].mean()),
-        "median_hold_bars": float(trades["hold_bars"].median()),
-    }
-
-
-def estimate_live_edge(frame: pd.DataFrame, trades: pd.DataFrame, cfg: Settings) -> dict[str, float | int | str] | None:
-    if frame.empty:
-        return None
-
-    row = frame.iloc[-1]
-    side = entry_side(row, cfg)
-
-    combo_z = float(row["combo_z"]) if pd.notna(row["combo_z"]) else float("nan")
-    spread_z = float(row["spread_z"]) if pd.notna(row["spread_z"]) else float("nan")
-    resid_z = float(row["resid_z"]) if pd.notna(row["resid_z"]) else float("nan")
-    corr = float(row["corr"]) if pd.notna(row["corr"]) else float("nan")
-    beta = float(row["beta"]) if pd.notna(row["beta"]) else float("nan")
-
-    if not side:
-        return {
-            "status": "no_entry",
-            "combo_z": combo_z,
-            "spread_z": spread_z,
-            "resid_z": resid_z,
-            "corr": corr,
-            "beta": beta,
-        }
-
-    if trades.empty:
-        return {
-            "status": "entry_but_no_history",
-            "side": int(side),
-            "combo_z": combo_z,
-            "spread_z": spread_z,
-            "resid_z": resid_z,
-            "corr": corr,
-            "beta": beta,
-        }
-
-    sample = trades[trades["side"] == side].copy()
-    sample["distance"] = (sample["combo_z"] - combo_z).abs()
-    sample = sample.sort_values("distance").head(20)
-
-    if sample.empty:
-        return {
-            "status": "entry_but_no_matches",
-            "side": int(side),
-            "combo_z": combo_z,
-            "spread_z": spread_z,
-            "resid_z": resid_z,
-            "corr": corr,
-            "beta": beta,
-        }
-
-    mean_net = float(sample["net_pnl_usd"].mean())
-
-    return {
-        "status": "entry" if mean_net > 0 else "skip",
-        "side": int(side),
-        "combo_z": combo_z,
-        "spread_z": spread_z,
-        "resid_z": resid_z,
-        "corr": corr,
-        "beta": beta,
-        "sample_n": int(len(sample)),
-        "hist_mean_net_pnl_usd": mean_net,
-        "hist_median_net_pnl_usd": float(sample["net_pnl_usd"].median()),
-        "hist_win_rate": float((sample["net_pnl_usd"] > 0).mean()),
-    }
