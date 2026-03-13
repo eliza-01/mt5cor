@@ -1,19 +1,20 @@
 # src/app/ui_relative_compare/ui/app.py
-# Tk application for scrollable fixed-size relative candles, divergence mode checkbox,
-# close-by-pair with PnL, persistent UI settings, interval selection stats, and opposite-position opening.
+# Tk application for scrollable fixed-size relative candles, direct per-pair SELL/BUY buttons,
+# auto/manual volume mode, close-by-pair with PnL, persistent UI settings, interval selection stats,
+# and opposite-position opening.
 from __future__ import annotations
 
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 from src.app.ui_relative_compare.constants import COMMON_SYMBOLS, TIMEFRAME_MINUTES
-from src.app.ui_relative_compare.models import RelativeMetrics, RenderSnapshot, TradePlan
+from src.app.ui_relative_compare.models import RelativeMetrics, RenderSnapshot
 from src.app.ui_relative_compare.services.market import (
     build_render_snapshot,
     calculate_relative_metrics,
     load_two_symbols,
 )
-from src.app.ui_relative_compare.services.trading import close_pair_positions, open_opposite_positions
+from src.app.ui_relative_compare.services.trading import close_pair_positions, open_pair_positions
 from src.app.ui_relative_compare.services.ui_state import UIState, load_ui_state, save_ui_state
 from src.app.ui_relative_compare.ui.chart import RelativeChart
 from src.broker.mt5_client import MT5Client
@@ -46,6 +47,14 @@ class RelativeCompareUI(tk.Tk):
         self.aggregate_info_var = tk.StringVar(value=f"{self.saved_state.timeframe} x {self.saved_state.aggregate_bars}")
         self.use_ratio_in_divergence_var = tk.BooleanVar(value=self.saved_state.use_ratio_in_divergence)
 
+        self.auto_volume_var = tk.BooleanVar(value=self.saved_state.auto_volume)
+        self.manual_lot_1_var = tk.StringVar(value=self.saved_state.manual_lot_1)
+        self.manual_lot_2_var = tk.StringVar(value=self.saved_state.manual_lot_2)
+        self.manual_lot_1_label_var = tk.StringVar(value="Lot EURUSD")
+        self.manual_lot_2_label_var = tk.StringVar(value="Lot AUDUSD")
+        self.header_symbol_1_var = tk.StringVar(value="EURO")
+        self.header_symbol_2_var = tk.StringVar(value="AUD")
+
         self.status_var = tk.StringVar(value="idle")
         self.account_var = tk.StringVar(value="-")
         self.ppm_1_var = tk.StringVar(value="-")
@@ -69,7 +78,6 @@ class RelativeCompareUI(tk.Tk):
         self.pair_gap_size_var = tk.StringVar(value=f"{self.pair_gap_adjust_px:+d}px")
 
         self.relative_metrics: RelativeMetrics | None = None
-        self.current_trade_plan: TradePlan | None = None
         self.current_snapshot: RenderSnapshot | None = None
 
         self.selected_start_index: int | None = None
@@ -80,6 +88,8 @@ class RelativeCompareUI(tk.Tk):
 
         self._build_ui()
         self._bind_state_persistence()
+        self._update_symbol_labels()
+        self._update_manual_volume_state()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build_ui(self) -> None:
@@ -122,11 +132,26 @@ class RelativeCompareUI(tk.Tk):
             command=self.on_toggle_divergence_mode,
         ).grid(row=1, column=0, columnspan=2, pady=(10, 0), sticky="w")
 
-        ttk.Button(controls, text="Подключить MT5", command=self.connect_mt5).grid(row=1, column=2, pady=(10, 0), sticky="w")
-        ttk.Button(controls, text="Рассчитать коэффициент", command=self.calculate_ratio).grid(row=1, column=3, columnspan=2, pady=(10, 0), sticky="w")
-        ttk.Button(controls, text="Старт", command=self.start_live).grid(row=1, column=5, pady=(10, 0), sticky="w")
-        ttk.Button(controls, text="Стоп", command=self.stop_live).grid(row=1, column=6, pady=(10, 0), sticky="w")
-        ttk.Button(controls, text="Разовый рендер", command=self.render_once).grid(row=1, column=7, pady=(10, 0), sticky="w")
+        ttk.Checkbutton(
+            controls,
+            text="Объем автоматически",
+            variable=self.auto_volume_var,
+            command=self.on_toggle_auto_volume,
+        ).grid(row=1, column=2, columnspan=2, pady=(10, 0), sticky="w")
+
+        ttk.Label(controls, textvariable=self.manual_lot_1_label_var).grid(row=1, column=4, pady=(10, 0), sticky="w")
+        self.manual_lot_1_entry = ttk.Entry(controls, textvariable=self.manual_lot_1_var, width=8)
+        self.manual_lot_1_entry.grid(row=1, column=5, padx=(6, 14), pady=(10, 0), sticky="w")
+
+        ttk.Label(controls, textvariable=self.manual_lot_2_label_var).grid(row=1, column=6, pady=(10, 0), sticky="w")
+        self.manual_lot_2_entry = ttk.Entry(controls, textvariable=self.manual_lot_2_var, width=8)
+        self.manual_lot_2_entry.grid(row=1, column=7, padx=(6, 14), pady=(10, 0), sticky="w")
+
+        ttk.Button(controls, text="Подключить MT5", command=self.connect_mt5).grid(row=1, column=8, pady=(10, 0), sticky="w")
+        ttk.Button(controls, text="Рассчитать коэффициент", command=self.calculate_ratio).grid(row=1, column=9, pady=(10, 0), sticky="w")
+        ttk.Button(controls, text="Старт", command=self.start_live).grid(row=1, column=10, pady=(10, 0), sticky="w")
+        ttk.Button(controls, text="Стоп", command=self.stop_live).grid(row=1, column=11, pady=(10, 0), sticky="w")
+        ttk.Button(controls, text="Разовый рендер", command=self.render_once).grid(row=1, column=12, pady=(10, 0), sticky="w")
 
         sizing = ttk.LabelFrame(root, text="Фиксированные размеры и отступы", padding=10)
         sizing.pack(fill="x", pady=(10, 0))
@@ -160,13 +185,9 @@ class RelativeCompareUI(tk.Tk):
         self._kv(info, 1, 4, "Коэф 1/2", self.ratio_1_to_2_var)
         self._kv(info, 1, 6, "Коэф 2/1", self.ratio_2_to_1_var)
 
-        trade = ttk.LabelFrame(root, text="Текущий opposite-план", padding=10)
+        trade = ttk.LabelFrame(root, text="Текущая логика и объем", padding=10)
         trade.pack(fill="x", pady=(10, 0))
-        self._kv(trade, 0, 0, "Логика", self.trade_hint_var)
-        self.trade_button = ttk.Button(trade, text="Открыть opposite позиции", command=self.open_current_positions)
-        self.trade_button.grid(row=0, column=2, padx=(18, 8), sticky="w")
-        self.close_button = ttk.Button(trade, text="Закрыть все по связке", command=self.close_current_pair_positions)
-        self.close_button.grid(row=0, column=3, padx=(8, 0), sticky="w")
+        self._kv(trade, 0, 0, "Состояние", self.trade_hint_var)
 
         selection = ttk.LabelFrame(root, text="Выбранный отрезок close-to-close", padding=10)
         selection.pack(fill="x", pady=(10, 0))
@@ -180,11 +201,11 @@ class RelativeCompareUI(tk.Tk):
         ttk.Label(
             hint,
             text=(
-                "Свечи внутри пары стоят вплотную без зазора. "
-                "Между соседними парами есть отдельный регулируемый отступ. "
-                "Клик по паре свечей или по точке нижнего графика выбирает отрезок: "
-                "первый клик — старт, второй — конец. Расчёт идёт close-to-close. "
-                "Все изменённые настройки сохраняются и поднимаются при следующем запуске."
+                "Справа над графиком находятся прямые кнопки SELL/BUY для каждой пары. "
+                "Нажатие на кнопку всегда открывает противоположную позицию по второй паре. "
+                "Галочка 'Объем автоматически' оставляет текущую логику расчета объема. "
+                "При отключении можно задать объем отдельно для каждой пары вручную. "
+                "Кнопка 'Закрыть все' закрывает все позиции по двум выбранным символам."
             ),
             wraplength=1300,
         ).pack(anchor="w")
@@ -218,15 +239,32 @@ class RelativeCompareUI(tk.Tk):
         charts_right.pack(side="left", fill="both", expand=True)
 
         charts_right.columnconfigure(0, weight=1)
-        charts_right.rowconfigure(0, weight=1)
-        charts_right.rowconfigure(1, weight=0)
+        charts_right.rowconfigure(1, weight=1)
         charts_right.rowconfigure(2, weight=0)
+        charts_right.rowconfigure(3, weight=0)
+
+        self.chart_header = tk.Frame(charts_right, bg="#111111", height=42)
+        self.chart_header.grid(row=0, column=0, sticky="ew")
+        self.chart_header.grid_propagate(False)
+
+        header_inner = tk.Frame(self.chart_header, bg="#111111")
+        header_inner.pack(side="right", padx=(0, 10), pady=(8, 4))
+
+        self._make_header_label(header_inner, self.header_symbol_1_var).pack(side="left", padx=(0, 6))
+        self._make_px_button(header_inner, "SELL", lambda: self.open_direct_order(1, "sell"), 60, 25).pack(side="left", padx=(0, 4))
+        self._make_px_button(header_inner, "BUY", lambda: self.open_direct_order(1, "buy"), 60, 25).pack(side="left", padx=(0, 12))
+
+        self._make_header_label(header_inner, self.header_symbol_2_var).pack(side="left", padx=(0, 6))
+        self._make_px_button(header_inner, "SELL", lambda: self.open_direct_order(2, "sell"), 60, 25).pack(side="left", padx=(0, 4))
+        self._make_px_button(header_inner, "BUY", lambda: self.open_direct_order(2, "buy"), 60, 25).pack(side="left", padx=(0, 16))
+
+        self._make_px_button(header_inner, "ЗАКРЫТЬ ВСЕ", self.close_current_pair_positions, 110, 25).pack(side="left")
 
         self.candle_canvas = tk.Canvas(charts_right, bg="#111111", highlightthickness=0)
-        self.candle_canvas.grid(row=0, column=0, sticky="nsew")
+        self.candle_canvas.grid(row=1, column=0, sticky="nsew")
 
         self.line_wrap = ttk.Frame(charts_right, height=180)
-        self.line_wrap.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.line_wrap.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         self.line_wrap.grid_propagate(False)
         self.line_wrap.columnconfigure(0, weight=1)
         self.line_wrap.rowconfigure(0, weight=1)
@@ -235,13 +273,49 @@ class RelativeCompareUI(tk.Tk):
         self.line_canvas.grid(row=0, column=0, sticky="nsew")
 
         self.h_scroll = ttk.Scrollbar(charts_right, orient="horizontal", command=self._on_scrollbar)
-        self.h_scroll.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self.h_scroll.grid(row=3, column=0, sticky="ew", pady=(8, 0))
 
         self.candle_canvas.configure(xscrollcommand=self._set_scrollbar)
         self.line_canvas.configure(xscrollcommand=self._set_scrollbar)
 
         self.chart = RelativeChart(self.candle_canvas, self.line_canvas)
         self._bind_scroll_events()
+
+    def _make_header_label(self, parent: tk.Widget, text_var: tk.StringVar) -> tk.Label:
+        return tk.Label(
+            parent,
+            textvariable=text_var,
+            bg="#111111",
+            fg="#d4d4d4",
+            font=("Segoe UI", 10, "bold"),
+            padx=0,
+            pady=0,
+        )
+
+    def _make_px_button(
+        self,
+        parent: tk.Widget,
+        text: str,
+        command,
+        width_px: int,
+        height_px: int,
+    ) -> tk.Frame:
+        frame = tk.Frame(parent, width=width_px, height=height_px, bg="#111111", highlightthickness=0, bd=0)
+        frame.pack_propagate(False)
+
+        button = tk.Button(
+            frame,
+            text=text,
+            command=command,
+            font=("Segoe UI", 8, "bold"),
+            relief="raised",
+            bd=1,
+            padx=0,
+            pady=0,
+            cursor="hand2",
+        )
+        button.pack(fill="both", expand=True)
+        return frame
 
     def _bind_state_persistence(self) -> None:
         tracked = [
@@ -253,9 +327,18 @@ class RelativeCompareUI(tk.Tk):
             self.refresh_ms_var,
             self.aggregate_bars_var,
             self.use_ratio_in_divergence_var,
+            self.auto_volume_var,
+            self.manual_lot_1_var,
+            self.manual_lot_2_var,
         ]
         for var in tracked:
             var.trace_add("write", self._schedule_state_save)
+
+        self.symbol_1_var.trace_add("write", self._on_symbols_changed)
+        self.symbol_2_var.trace_add("write", self._on_symbols_changed)
+        self.manual_lot_1_var.trace_add("write", self._on_manual_volume_changed)
+        self.manual_lot_2_var.trace_add("write", self._on_manual_volume_changed)
+
         self.bind("<Configure>", self._on_window_configure)
 
     def _on_window_configure(self, event) -> None:
@@ -284,6 +367,9 @@ class RelativeCompareUI(tk.Tk):
             refresh_ms=self.refresh_ms_var.get().strip() or "250",
             aggregate_bars=self.aggregate_bars_var.get().strip() or "1",
             use_ratio_in_divergence=bool(self.use_ratio_in_divergence_var.get()),
+            auto_volume=bool(self.auto_volume_var.get()),
+            manual_lot_1=self.manual_lot_1_var.get().strip() or "0.10",
+            manual_lot_2=self.manual_lot_2_var.get().strip() or "0.10",
             width_adjust_px=int(self.width_adjust_px),
             height_adjust_px=int(self.height_adjust_px),
             pair_gap_adjust_px=int(self.pair_gap_adjust_px),
@@ -376,6 +462,40 @@ class RelativeCompareUI(tk.Tk):
 
         self._redraw_current_snapshot()
 
+    def _normalize_symbol(self, symbol: str) -> str:
+        return "".join(ch for ch in symbol.upper() if "A" <= ch <= "Z")[:6] or symbol.upper()
+
+    def _base_label(self, symbol: str) -> str:
+        normalized = self._normalize_symbol(symbol)
+        base = normalized[:3]
+        if base == "EUR":
+            return "EURO"
+        if base:
+            return base
+        return symbol.upper()
+
+    def _update_symbol_labels(self) -> None:
+        symbol_1 = self.symbol_1_var.get().strip() or "EURUSD"
+        symbol_2 = self.symbol_2_var.get().strip() or "AUDUSD"
+
+        self.manual_lot_1_label_var.set(f"Lot {self._normalize_symbol(symbol_1)}")
+        self.manual_lot_2_label_var.set(f"Lot {self._normalize_symbol(symbol_2)}")
+        self.header_symbol_1_var.set(self._base_label(symbol_1))
+        self.header_symbol_2_var.set(self._base_label(symbol_2))
+
+    def _on_symbols_changed(self, *_args) -> None:
+        self._update_symbol_labels()
+        self._schedule_state_save()
+
+    def _on_manual_volume_changed(self, *_args) -> None:
+        if not self.auto_volume_var.get():
+            self._update_trade_hint()
+
+    def _update_manual_volume_state(self) -> None:
+        state = "disabled" if self.auto_volume_var.get() else "normal"
+        self.manual_lot_1_entry.configure(state=state)
+        self.manual_lot_2_entry.configure(state=state)
+
     def connect_mt5(self) -> None:
         try:
             if self.connected:
@@ -415,6 +535,44 @@ class RelativeCompareUI(tk.Tk):
             raise RuntimeError("Нужно выбрать две разные пары")
 
         return symbol_1, symbol_2, timeframe, calc_bars, visible_bars, refresh_ms, aggregate_bars
+
+    def _read_positive_lot(self, raw: str, symbol: str) -> float:
+        text = str(raw).strip().replace(",", ".")
+        value = float(text)
+        if value <= 0:
+            raise RuntimeError(f"Объем для {symbol} должен быть больше 0")
+        return value
+
+    def _resolve_pair_lots(self, strict: bool = True) -> tuple[float, float]:
+        symbol_1 = self.symbol_1_var.get().strip() or "EURUSD"
+        symbol_2 = self.symbol_2_var.get().strip() or "AUDUSD"
+
+        if self.auto_volume_var.get():
+            if self.current_snapshot is not None:
+                return (
+                    float(self.current_snapshot.trade_plan.symbol_1_lots),
+                    float(self.current_snapshot.trade_plan.symbol_2_lots),
+                )
+
+            if self.relative_metrics is None:
+                if strict:
+                    raise RuntimeError("Для авто-объема сначала нажми 'Рассчитать коэффициент'")
+                return self.base_cfg.base_lot_eurusd, self.base_cfg.base_lot_eurusd
+
+            return (
+                float(self.base_cfg.base_lot_eurusd),
+                float(self.base_cfg.base_lot_eurusd * self.relative_metrics.ratio_1_to_2),
+            )
+
+        try:
+            return (
+                self._read_positive_lot(self.manual_lot_1_var.get(), symbol_1),
+                self._read_positive_lot(self.manual_lot_2_var.get(), symbol_2),
+            )
+        except Exception:
+            if strict:
+                raise
+            return 0.0, 0.0
 
     def calculate_ratio(self) -> None:
         try:
@@ -462,7 +620,6 @@ class RelativeCompareUI(tk.Tk):
             )
 
             self.current_snapshot = snapshot
-            self.current_trade_plan = snapshot.trade_plan
 
             if snapshot.bars.empty:
                 return
@@ -470,13 +627,6 @@ class RelativeCompareUI(tk.Tk):
             self._normalize_selection_indices(len(snapshot.bars))
             self.aggregate_info_var.set(f"{timeframe} x {aggregate_bars} | {len(snapshot.bars)} свечей")
             self.last_bar_time_var.set(str(snapshot.bars.iloc[-1]["time"]))
-            self.trade_hint_var.set(
-                f"Лидер {snapshot.trade_plan.leader_symbol} {snapshot.trade_plan.leader_move:.2f} | "
-                f"ведомая {snapshot.trade_plan.follower_symbol} {snapshot.trade_plan.follower_move:.2f} | "
-                f"SELL {snapshot.trade_plan.sell_symbol} {snapshot.trade_plan.sell_lots:.2f} / "
-                f"BUY {snapshot.trade_plan.buy_symbol} {snapshot.trade_plan.buy_lots:.2f}"
-            )
-            self.trade_button.configure(text=snapshot.trade_plan.button_text)
 
             self.chart.draw(
                 bars=snapshot.bars,
@@ -501,6 +651,7 @@ class RelativeCompareUI(tk.Tk):
                 self._sync_canvas_view(1.0)
 
             self.status_var.set("rendered")
+            self._update_trade_hint()
             self._update_selection_stats()
             self._schedule_state_save()
         except Exception as exc:
@@ -534,6 +685,7 @@ class RelativeCompareUI(tk.Tk):
 
         self.update_idletasks()
         self._sync_canvas_view(prev_x)
+        self._update_trade_hint()
         self._update_selection_stats()
 
     def _normalize_selection_indices(self, bars_count: int) -> None:
@@ -551,6 +703,26 @@ class RelativeCompareUI(tk.Tk):
         if self.selected_start_index is not None and self.selected_end_index is not None:
             if self.selected_end_index < self.selected_start_index:
                 self.selected_start_index, self.selected_end_index = self.selected_end_index, self.selected_start_index
+
+    def _update_trade_hint(self) -> None:
+        snapshot = self.current_snapshot
+        if snapshot is None:
+            self.trade_hint_var.set("-")
+            return
+
+        mode_text = "AUTO" if self.auto_volume_var.get() else "MANUAL"
+
+        try:
+            lot_1, lot_2 = self._resolve_pair_lots(strict=not self.auto_volume_var.get())
+            self.trade_hint_var.set(
+                f"{mode_text} | {snapshot.trade_plan.symbol_1} {lot_1:.2f} | "
+                f"{snapshot.trade_plan.symbol_2} {lot_2:.2f} | "
+                f"лидер {snapshot.trade_plan.leader_symbol} {snapshot.trade_plan.leader_move:.2f} | "
+                f"ведомая {snapshot.trade_plan.follower_symbol} {snapshot.trade_plan.follower_move:.2f} | "
+                f"подсказка SELL {snapshot.trade_plan.sell_symbol} / BUY {snapshot.trade_plan.buy_symbol}"
+            )
+        except Exception as exc:
+            self.trade_hint_var.set(f"{mode_text} | ошибка объема: {exc}")
 
     def _update_selection_stats(self) -> None:
         if self.current_snapshot is None or self.current_snapshot.bars.empty:
@@ -615,6 +787,11 @@ class RelativeCompareUI(tk.Tk):
         if self.current_snapshot is not None:
             self.render_once()
 
+    def on_toggle_auto_volume(self) -> None:
+        self._update_manual_volume_state()
+        self._schedule_state_save()
+        self._update_trade_hint()
+
     def change_size(self, axis: str, delta: int) -> None:
         if axis == "width":
             self.width_adjust_px += delta
@@ -648,28 +825,54 @@ class RelativeCompareUI(tk.Tk):
         if self.current_snapshot is not None:
             self.render_once()
 
-    def open_current_positions(self) -> None:
+    def _build_direct_order(self, symbol_index: int, side: str) -> tuple[str, str, float, float]:
+        symbol_1, symbol_2, _, _, _, _, _ = self._read_inputs()
+        lot_1, lot_2 = self._resolve_pair_lots(strict=True)
+
+        if symbol_index == 1 and side == "sell":
+            return symbol_1, symbol_2, lot_1, lot_2
+        if symbol_index == 1 and side == "buy":
+            return symbol_2, symbol_1, lot_2, lot_1
+        if symbol_index == 2 and side == "sell":
+            return symbol_2, symbol_1, lot_2, lot_1
+        if symbol_index == 2 and side == "buy":
+            return symbol_1, symbol_2, lot_1, lot_2
+
+        raise RuntimeError("Некорректная команда открытия")
+
+    def open_direct_order(self, symbol_index: int, side: str) -> None:
         try:
             self._ensure_connected()
             assert self.client is not None
 
-            if self.current_trade_plan is None:
-                raise RuntimeError("Сначала сделай рендер, чтобы появился текущий opposite-план")
+            if self.auto_volume_var.get() and self.relative_metrics is None:
+                raise RuntimeError("Для авто-объема сначала нажми 'Рассчитать коэффициент'")
 
-            result = open_opposite_positions(self.client, self.base_cfg, self.current_trade_plan)
+            sell_symbol, buy_symbol, sell_lots, buy_lots = self._build_direct_order(symbol_index, side)
+            result = open_pair_positions(
+                client=self.client,
+                cfg=self.base_cfg,
+                sell_symbol=sell_symbol,
+                buy_symbol=buy_symbol,
+                sell_lots=sell_lots,
+                buy_lots=buy_lots,
+            )
+
             self.status_var.set("orders_opened")
             messagebox.showinfo(
                 "Позиции открыты",
                 (
-                    f"SELL {self.current_trade_plan.sell_symbol} {self.current_trade_plan.sell_lots:.2f}\n"
-                    f"BUY {self.current_trade_plan.buy_symbol} {self.current_trade_plan.buy_lots:.2f}\n"
+                    f"SELL {sell_symbol} {result.sell_volume:.2f}\n"
+                    f"BUY {buy_symbol} {result.buy_volume:.2f}\n"
                     f"sell_order={result.sell_order} retcode={result.sell_retcode}\n"
                     f"buy_order={result.buy_order} retcode={result.buy_retcode}"
                 ),
             )
+            if self.current_snapshot is not None:
+                self.render_once()
         except Exception as exc:
             self.status_var.set("order_error")
-            messagebox.showerror("Открытие opposite позиций", str(exc))
+            messagebox.showerror("Открытие противоположных позиций", str(exc))
 
     def close_current_pair_positions(self) -> None:
         try:
@@ -684,11 +887,16 @@ class RelativeCompareUI(tk.Tk):
                 (
                     f"Связка: {symbol_1} / {symbol_2}\n"
                     f"Закрыто позиций: {summary.closed_count}\n"
-                    f"gross+swap pnl usd: {summary.gross_pnl_usd:.2f}\n"
-                    f"net est pnl usd: {summary.net_pnl_est_usd:.2f}"
+                    f"Сделок MT: {summary.deals_count}\n"
+                    f"MT profit: {summary.profit_usd:.2f}\n"
+                    f"MT commission: {summary.commission_usd:.2f}\n"
+                    f"MT swap: {summary.swap_usd:.2f}\n"
+                    f"MT fee: {summary.fee_usd:.2f}\n"
+                    f"MT total pnl: {summary.total_pnl_usd:.2f}"
                 ),
             )
-            self.render_once()
+            if self.current_snapshot is not None:
+                self.render_once()
         except Exception as exc:
             self.status_var.set("close_error")
             messagebox.showerror("Закрытие позиций по связке", str(exc))

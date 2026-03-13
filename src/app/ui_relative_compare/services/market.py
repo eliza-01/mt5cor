@@ -223,14 +223,12 @@ def build_trade_plan(
     move_1 = abs(float(row["p1_close"]))
     move_2 = abs(float(row["p2_close"]))
 
-    base_lot_1 = normalize_lot(cfg.base_lot_eurusd, meta_1)
-    base_lot_2 = normalize_lot(cfg.base_lot_eurusd * ratio_1_to_2, meta_2)
+    lot_1 = normalize_lot(cfg.base_lot_eurusd, meta_1)
+    lot_2 = normalize_lot(cfg.base_lot_eurusd * ratio_1_to_2, meta_2)
 
     if move_1 >= move_2:
         sell_symbol = symbol_1
         buy_symbol = symbol_2
-        sell_lots = base_lot_1
-        buy_lots = base_lot_2
         leader_symbol = symbol_1
         follower_symbol = symbol_2
         leader_move = move_1
@@ -238,23 +236,22 @@ def build_trade_plan(
     else:
         sell_symbol = symbol_2
         buy_symbol = symbol_1
-        sell_lots = base_lot_2
-        buy_lots = base_lot_1
         leader_symbol = symbol_2
         follower_symbol = symbol_1
         leader_move = move_2
         follower_move = move_1
 
     return TradePlan(
+        symbol_1=symbol_1,
+        symbol_2=symbol_2,
+        symbol_1_lots=lot_1,
+        symbol_2_lots=lot_2,
         sell_symbol=sell_symbol,
         buy_symbol=buy_symbol,
-        sell_lots=sell_lots,
-        buy_lots=buy_lots,
         leader_symbol=leader_symbol,
         follower_symbol=follower_symbol,
         leader_move=leader_move,
         follower_move=follower_move,
-        button_text=f"Открыть SELL {sell_symbol} / BUY {buy_symbol}",
     )
 
 

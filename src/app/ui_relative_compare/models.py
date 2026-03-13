@@ -25,15 +25,16 @@ class DivergenceStats:
 
 @dataclass(slots=True)
 class TradePlan:
+    symbol_1: str
+    symbol_2: str
+    symbol_1_lots: float
+    symbol_2_lots: float
     sell_symbol: str
     buy_symbol: str
-    sell_lots: float
-    buy_lots: float
     leader_symbol: str
     follower_symbol: str
     leader_move: float
     follower_move: float
-    button_text: str
 
 
 @dataclass(slots=True)

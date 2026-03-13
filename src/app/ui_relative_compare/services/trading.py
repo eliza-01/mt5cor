@@ -1,20 +1,25 @@
-
 # src/app/ui_relative_compare/services/trading.py
-# Sends opposite market orders for the current relative leader and follower,
-# and closes all positions for the selected pair with PnL summary.
+# Sends opposite market orders for an explicitly selected symbol direction,
+# and closes all positions for the selected pair with PnL summary from actual MT5 deal history.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+import time
 
 import MetaTrader5 as mt5
 
-from src.app.ui_relative_compare.models import TradePlan
 from src.broker.mt5_client import MT5Client
 from src.common.settings import Settings
-from src.strategy.costs import commission_usd_per_lot_one_way
 
 
 CLIENT_DISABLES_AT = 10027
+MIN_ORDER_LOTS = 0.01
+
+DEAL_ENTRY_OUT = int(getattr(mt5, "DEAL_ENTRY_OUT", 1))
+DEAL_ENTRY_OUT_BY = int(getattr(mt5, "DEAL_ENTRY_OUT_BY", 3))
+DEAL_ENTRY_INOUT = int(getattr(mt5, "DEAL_ENTRY_INOUT", 2))
+CLOSE_ENTRIES = {DEAL_ENTRY_OUT, DEAL_ENTRY_OUT_BY, DEAL_ENTRY_INOUT}
 
 
 @dataclass(slots=True)
@@ -23,13 +28,19 @@ class OrderSendSummary:
     buy_retcode: int
     sell_order: int
     buy_order: int
+    sell_volume: float
+    buy_volume: float
 
 
 @dataclass(slots=True)
 class ClosePairSummary:
     closed_count: int
-    gross_pnl_usd: float
-    net_pnl_est_usd: float
+    deals_count: int
+    profit_usd: float
+    commission_usd: float
+    swap_usd: float
+    fee_usd: float
+    total_pnl_usd: float
 
 
 def _terminal_flags() -> dict:
@@ -58,6 +69,28 @@ def _ensure_python_trading_enabled() -> None:
             "В MT5 выключена автоматическая торговля. "
             "Включи кнопку Algo Trading в терминале."
         )
+
+
+def _normalize_volume(volume: float, symbol: str) -> float:
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        raise RuntimeError(f"Не удалось получить symbol_info для {symbol}")
+
+    step = float(getattr(info, "volume_step", 0.0) or MIN_ORDER_LOTS)
+    minimum = float(getattr(info, "volume_min", 0.0) or MIN_ORDER_LOTS)
+    maximum = float(getattr(info, "volume_max", 0.0) or 0.0)
+
+    raw = float(volume)
+    if raw <= 0:
+        raise RuntimeError(f"Объем для {symbol} должен быть больше 0")
+
+    clamped = max(raw, minimum)
+    if maximum > 0:
+        clamped = min(clamped, maximum)
+
+    normalized = math.floor((clamped + 1e-12) / step) * step
+    digits = max(0, len(str(step).split(".")[-1].rstrip("0"))) if "." in str(step) else 0
+    return round(max(normalized, minimum), digits)
 
 
 def _filling_candidates(symbol: str) -> list[int]:
@@ -224,27 +257,80 @@ def _symbol_positions(symbol: str) -> list:
     return list(items or [])
 
 
-def _estimated_round_turn_commission_usd(symbol: str, volume: float, cfg: Settings) -> float:
-    rate = commission_usd_per_lot_one_way(symbol, cfg)
-    if rate is None:
-        return 0.0
-    return float(rate) * float(volume) * cfg.round_turn_multiplier
+def _position_is_closed(ticket: int) -> bool:
+    items = mt5.positions_get(ticket=int(ticket))
+    return not items
 
 
-def open_opposite_positions(
+def _position_deals(ticket: int) -> list:
+    deals = mt5.history_deals_get(position=int(ticket))
+    return list(deals or [])
+
+
+def _has_close_deal(deals: list) -> bool:
+    for deal in deals:
+        entry = int(getattr(deal, "entry", -1))
+        if entry in CLOSE_ENTRIES:
+            return True
+    return False
+
+
+def _wait_closed_position_deals(ticket: int, timeout_sec: float = 10.0, sleep_sec: float = 0.2) -> list:
+    deadline = time.time() + timeout_sec
+    last_deals: list = []
+
+    while time.time() < deadline:
+        closed = _position_is_closed(ticket)
+        deals = _position_deals(ticket)
+
+        if deals:
+            last_deals = deals
+            if _has_close_deal(deals):
+                return deals
+
+        if closed and deals:
+            return deals
+
+        time.sleep(sleep_sec)
+
+    return last_deals
+
+
+def _sum_deals(deals: list) -> tuple[float, float, float, float]:
+    profit_usd = 0.0
+    commission_usd = 0.0
+    swap_usd = 0.0
+    fee_usd = 0.0
+
+    for deal in deals:
+        profit_usd += float(getattr(deal, "profit", 0.0) or 0.0)
+        commission_usd += float(getattr(deal, "commission", 0.0) or 0.0)
+        swap_usd += float(getattr(deal, "swap", 0.0) or 0.0)
+        fee_usd += float(getattr(deal, "fee", 0.0) or 0.0)
+
+    return profit_usd, commission_usd, swap_usd, fee_usd
+
+
+def open_pair_positions(
     client: MT5Client,
     cfg: Settings,
-    plan: TradePlan,
+    sell_symbol: str,
+    buy_symbol: str,
+    sell_lots: float,
+    buy_lots: float,
     deviation: int = 20,
 ) -> OrderSendSummary:
     _ensure_python_trading_enabled()
 
-    client.ensure_symbol(plan.sell_symbol)
-    client.ensure_symbol(plan.buy_symbol)
+    client.ensure_symbol(sell_symbol)
+    client.ensure_symbol(buy_symbol)
+
+    normalized_sell_lots = _normalize_volume(sell_lots, sell_symbol)
+    normalized_buy_lots = _normalize_volume(buy_lots, buy_symbol)
 
     sell_result = _send_market_with_fill_fallback(
-        symbol=plan.sell_symbol,
-        volume=plan.sell_lots,
+        symbol=sell_symbol,
+        volume=normalized_sell_lots,
         side="sell",
         deviation=deviation,
         magic=cfg.mt5_magic,
@@ -252,8 +338,8 @@ def open_opposite_positions(
     )
 
     buy_result = _send_market_with_fill_fallback(
-        symbol=plan.buy_symbol,
-        volume=plan.buy_lots,
+        symbol=buy_symbol,
+        volume=normalized_buy_lots,
         side="buy",
         deviation=deviation,
         magic=cfg.mt5_magic,
@@ -265,6 +351,8 @@ def open_opposite_positions(
         buy_retcode=int(buy_result.retcode),
         sell_order=int(getattr(sell_result, "order", 0) or 0),
         buy_order=int(getattr(buy_result, "order", 0) or 0),
+        sell_volume=normalized_sell_lots,
+        buy_volume=normalized_buy_lots,
     )
 
 
@@ -277,34 +365,60 @@ def close_pair_positions(
 ) -> ClosePairSummary:
     _ensure_python_trading_enabled()
 
-    positions = [* _symbol_positions(symbol_1), * _symbol_positions(symbol_2)]
+    positions = [*_symbol_positions(symbol_1), *_symbol_positions(symbol_2)]
     if not positions:
-        return ClosePairSummary(closed_count=0, gross_pnl_usd=0.0, net_pnl_est_usd=0.0)
-
-    gross_pnl_usd = 0.0
-    commission_est_usd = 0.0
-
-    for position in positions:
-        gross_pnl_usd += float(getattr(position, "profit", 0.0) or 0.0)
-        gross_pnl_usd += float(getattr(position, "swap", 0.0) or 0.0)
-        commission_est_usd += _estimated_round_turn_commission_usd(str(position.symbol), float(position.volume), cfg)
+        return ClosePairSummary(
+            closed_count=0,
+            deals_count=0,
+            profit_usd=0.0,
+            commission_usd=0.0,
+            swap_usd=0.0,
+            fee_usd=0.0,
+            total_pnl_usd=0.0,
+        )
 
     errors: list[str] = []
     closed_count = 0
+    closed_tickets: list[int] = []
 
     for position in positions:
         try:
             client.ensure_symbol(str(position.symbol))
             _close_position_with_fill_fallback(position, deviation=deviation, magic=cfg.mt5_magic)
             closed_count += 1
+            closed_tickets.append(int(position.ticket))
         except Exception as exc:
             errors.append(str(exc))
 
     if errors:
         raise RuntimeError("\n".join(errors))
 
+    all_deals: list = []
+    missing_tickets: list[int] = []
+
+    for ticket in closed_tickets:
+        deals = _wait_closed_position_deals(ticket)
+        if not deals:
+            missing_tickets.append(ticket)
+            continue
+        all_deals.extend(deals)
+
+    if missing_tickets:
+        missing_text = ", ".join(str(ticket) for ticket in missing_tickets)
+        raise RuntimeError(
+            "Позиции закрыты, но MT5 пока не отдал историю сделок по position_id: "
+            f"{missing_text}. Повтори через 1-2 секунды."
+        )
+
+    profit_usd, commission_usd, swap_usd, fee_usd = _sum_deals(all_deals)
+    total_pnl_usd = profit_usd + commission_usd + swap_usd + fee_usd
+
     return ClosePairSummary(
         closed_count=closed_count,
-        gross_pnl_usd=float(gross_pnl_usd),
-        net_pnl_est_usd=float(gross_pnl_usd - commission_est_usd),
+        deals_count=len(all_deals),
+        profit_usd=float(profit_usd),
+        commission_usd=float(commission_usd),
+        swap_usd=float(swap_usd),
+        fee_usd=float(fee_usd),
+        total_pnl_usd=float(total_pnl_usd),
     )

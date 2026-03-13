@@ -1,5 +1,5 @@
 # src/app/ui_relative_compare/ui/chart.py
-# Draws a fixed-size scrollable candle tape and a synced divergence line chart below it.
+# Draws a fixed-size scrollable candle tape and a synced two-line divergence chart below it.
 from __future__ import annotations
 
 import tkinter as tk
@@ -23,6 +23,7 @@ BASE_BODY_HALF = 4.0
 BASE_PAIR_GAP = 10.0
 LEFT_PAD = 60
 RIGHT_PAD = 30
+EPS = 1e-12
 
 
 class RelativeChart:
@@ -45,6 +46,9 @@ class RelativeChart:
         selected_start_index: int | None,
         selected_end_index: int | None,
     ) -> None:
+        _ = divergence_series
+        _ = divergence_stats
+
         self._draw_candles(
             bars=bars,
             symbol_1=symbol_1,
@@ -53,13 +57,18 @@ class RelativeChart:
             width_adjust_px=width_adjust_px,
             height_adjust_px=height_adjust_px,
             pair_gap_adjust_px=pair_gap_adjust_px,
-            divergence_stats=divergence_stats,
             trade_plan=trade_plan,
             selected_start_index=selected_start_index,
             selected_end_index=selected_end_index,
         )
-        self._draw_divergence_line(
-            divergence_series=divergence_series,
+
+        line_1, line_2 = self._build_relative_line_series(bars, ratio_1_to_2)
+
+        self._draw_relative_lines(
+            line_1=line_1,
+            line_2=line_2,
+            symbol_1=symbol_1,
+            symbol_2=symbol_2,
             width_adjust_px=width_adjust_px,
             pair_gap_adjust_px=pair_gap_adjust_px,
             selected_start_index=selected_start_index,
@@ -107,6 +116,79 @@ class RelativeChart:
         pair_center_x = pair_left + pair_width / 2.0
         return p1_x, p2_x, pair_center_x
 
+    def _estimate_pip_size(
+        self,
+        price_delta: pd.Series,
+        scaled_delta: pd.Series,
+        factor: float,
+        default: float,
+    ) -> float:
+        candidates: list[float] = []
+
+        for raw_delta, scaled in zip(price_delta.tolist(), scaled_delta.tolist()):
+            raw_value = float(raw_delta)
+            scaled_value = float(scaled)
+            if abs(raw_value) <= EPS or abs(scaled_value) <= EPS:
+                continue
+            candidates.append(abs((raw_value * factor) / scaled_value))
+
+        if not candidates:
+            return default
+
+        candidates.sort()
+        return float(candidates[len(candidates) // 2])
+
+    def _build_relative_line_series(
+        self,
+        bars: pd.DataFrame,
+        ratio_1_to_2: float,
+    ) -> tuple[pd.Series, pd.Series]:
+        if bars.empty:
+            return pd.Series(dtype=float), pd.Series(dtype=float)
+
+        raw_delta_1 = (bars["close_1"] - bars["open_1"]).astype(float)
+        raw_delta_2 = (bars["close_2"] - bars["open_2"]).astype(float)
+
+        pip_1 = self._estimate_pip_size(
+            price_delta=raw_delta_1,
+            scaled_delta=bars["p1_close"].astype(float),
+            factor=1.0,
+            default=0.0001,
+        )
+        pip_2 = self._estimate_pip_size(
+            price_delta=raw_delta_2,
+            scaled_delta=bars["p2_close"].astype(float),
+            factor=max(float(ratio_1_to_2), EPS),
+            default=0.0001,
+        )
+
+        close_to_close_1 = bars["close_1"].astype(float).diff().fillna(0.0) / pip_1
+        close_to_close_2 = bars["close_2"].astype(float).diff().fillna(0.0) / pip_2
+
+        out_1: list[float] = [0.0]
+        out_2: list[float] = [0.0]
+
+        acc_1 = 0.0
+        acc_2 = 0.0
+
+        for i in range(1, len(bars)):
+            move_1 = float(close_to_close_1.iloc[i])
+            move_2 = float(close_to_close_2.iloc[i])
+
+            if move_1 * move_2 > 0:
+                common = min(abs(move_1), abs(move_2))
+                direction = 1.0 if move_1 > 0 else -1.0
+                move_1 -= direction * common
+                move_2 -= direction * common
+
+            acc_1 += move_1
+            acc_2 += move_2
+
+            out_1.append(acc_1)
+            out_2.append(acc_2)
+
+        return pd.Series(out_1, dtype=float), pd.Series(out_2, dtype=float)
+
     def _draw_candles(
         self,
         bars: pd.DataFrame,
@@ -116,7 +198,6 @@ class RelativeChart:
         width_adjust_px: int,
         height_adjust_px: int,
         pair_gap_adjust_px: int,
-        divergence_stats: DivergenceStats,
         trade_plan: TradePlan,
         selected_start_index: int | None,
         selected_end_index: int | None,
@@ -141,7 +222,7 @@ class RelativeChart:
         center_y = height / 2
         left_pad = LEFT_PAD
         right_pad = RIGHT_PAD
-        top_pad = 118
+        top_pad = 92
         bottom_pad = 34
 
         n = len(bars)
@@ -228,24 +309,6 @@ class RelativeChart:
         )
 
         self._draw_pair_legend(symbol_1, symbol_2, fixed_left_x, 10)
-
-        mode_text = "с коэф" if divergence_stats.uses_ratio else "реал"
-        divergence_text = (
-            f"Δ режим: {mode_text}\n"
-            f"Лента Δ: {divergence_stats.total_diff_pips:+.2f} п\n"
-            f"Текущая свеча Δ: {divergence_stats.current_bar_diff_pips:+.2f} п\n"
-            f"Live bid Δ: {divergence_stats.live_diff_pips:+.2f} п"
-        )
-        self.candle_canvas.create_text(
-            fixed_right_x,
-            10,
-            anchor="ne",
-            fill=CHART_TEXT,
-            font=("Segoe UI", 10, "bold"),
-            justify="right",
-            text=divergence_text,
-        )
-
         self._draw_trade_arrows(
             last_points=last_points,
             symbol_1=symbol_1,
@@ -268,9 +331,12 @@ class RelativeChart:
 
         self.candle_canvas.configure(scrollregion=(0, 0, total_width, height))
 
-    def _draw_divergence_line(
+    def _draw_relative_lines(
         self,
-        divergence_series: pd.Series,
+        line_1: pd.Series,
+        line_2: pd.Series,
+        symbol_1: str,
+        symbol_2: str,
         width_adjust_px: int,
         pair_gap_adjust_px: int,
         selected_start_index: int | None,
@@ -298,11 +364,16 @@ class RelativeChart:
         top_pad = 18
         bottom_pad = 22
 
-        n = len(divergence_series)
+        n = max(len(line_1), len(line_2))
         body_half, pair_gap, pair_width = self._pair_layout(width_adjust_px, pair_gap_adjust_px)
         total_width = max(viewport_width, left_pad + self._pair_total_width(n, pair_width, pair_gap) + right_pad)
 
-        max_abs = max(1.0, float(divergence_series.abs().max()) if not divergence_series.empty else 1.0)
+        max_abs = 1.0
+        if not line_1.empty:
+            max_abs = max(max_abs, float(line_1.abs().max()))
+        if not line_2.empty:
+            max_abs = max(max_abs, float(line_2.abs().max()))
+
         mid_y = height / 2
         usable_half = max(20.0, (height - top_pad - bottom_pad) / 2)
         scale = usable_half / (max_abs * 1.1)
@@ -315,19 +386,31 @@ class RelativeChart:
             self.line_canvas.create_line(left_pad, mid_y - dy, total_width - right_pad, mid_y - dy, fill=CHART_GRID)
             self.line_canvas.create_line(left_pad, mid_y + dy, total_width - right_pad, mid_y + dy, fill=CHART_GRID)
 
-        points: list[float] = []
-        for i, value in enumerate(divergence_series.tolist()):
-            _, _, pair_center_x = self._pair_positions(i, left_pad, body_half, pair_gap, pair_width)
-            y = mid_y - float(value) * scale
-            points.extend([pair_center_x, y])
+        points_1: list[float] = []
+        points_2: list[float] = []
 
-        if len(points) >= 4:
-            self.line_canvas.create_line(*points, fill="#eab308", width=2, smooth=False)
-        elif len(points) == 2:
-            self.line_canvas.create_oval(points[0] - 2, points[1] - 2, points[0] + 2, points[1] + 2, fill="#eab308", outline="#eab308")
+        for i in range(n):
+            _, _, pair_center_x = self._pair_positions(i, left_pad, body_half, pair_gap, pair_width)
+
+            y_1 = mid_y - float(line_1.iloc[i]) * scale
+            y_2 = mid_y - float(line_2.iloc[i]) * scale
+
+            points_1.extend([pair_center_x, y_1])
+            points_2.extend([pair_center_x, y_2])
+
+        if len(points_1) >= 4:
+            self.line_canvas.create_line(*points_1, fill=PAIR_1_UP, width=1, smooth=False)
+        elif len(points_1) == 2:
+            self.line_canvas.create_oval(points_1[0] - 1, points_1[1] - 1, points_1[0] + 1, points_1[1] + 1, fill=PAIR_1_UP, outline=PAIR_1_UP)
+
+        if len(points_2) >= 4:
+            self.line_canvas.create_line(*points_2, fill=PAIR_2_UP, width=1, smooth=False)
+        elif len(points_2) == 2:
+            self.line_canvas.create_oval(points_2[0] - 1, points_2[1] - 1, points_2[0] + 1, points_2[1] + 1, fill=PAIR_2_UP, outline=PAIR_2_UP)
 
         self._draw_selection_on_line(
-            divergence_series=divergence_series,
+            line_1=line_1,
+            line_2=line_2,
             body_half=body_half,
             pair_gap=pair_gap,
             pair_width=pair_width,
@@ -338,13 +421,33 @@ class RelativeChart:
             selected_end_index=selected_end_index,
         )
 
+        left_text = f"{symbol_1}: тонкая линия"
+        right_text = f"{symbol_2}: тонкая линия"
+        title_text = "close→close, общий ход в одну сторону вычтен"
+
         self.line_canvas.create_text(
             viewport_left + 16,
             6,
             anchor="nw",
             fill=CHART_TEXT,
             font=("Segoe UI", 9, "bold"),
-            text="Линия расхождения",
+            text=left_text,
+        )
+        self.line_canvas.create_text(
+            viewport_left + viewport_width / 2.0,
+            6,
+            anchor="n",
+            fill=CHART_TEXT,
+            font=("Segoe UI", 9),
+            text=title_text,
+        )
+        self.line_canvas.create_text(
+            viewport_right - 16,
+            6,
+            anchor="ne",
+            fill=CHART_TEXT,
+            font=("Segoe UI", 9, "bold"),
+            text=right_text,
         )
 
         self.line_canvas.configure(scrollregion=(0, 0, total_width, height))
@@ -437,7 +540,8 @@ class RelativeChart:
 
     def _draw_selection_on_line(
         self,
-        divergence_series: pd.Series,
+        line_1: pd.Series,
+        line_2: pd.Series,
         body_half: float,
         pair_gap: float,
         pair_width: float,
@@ -447,11 +551,12 @@ class RelativeChart:
         selected_start_index: int | None,
         selected_end_index: int | None,
     ) -> None:
-        if selected_start_index is None or divergence_series.empty:
+        if selected_start_index is None or line_1.empty or line_2.empty:
             return
 
-        start_index = max(0, min(len(divergence_series) - 1, int(selected_start_index)))
-        end_index = start_index if selected_end_index is None else max(0, min(len(divergence_series) - 1, int(selected_end_index)))
+        limit = min(len(line_1), len(line_2)) - 1
+        start_index = max(0, min(limit, int(selected_start_index)))
+        end_index = start_index if selected_end_index is None else max(0, min(limit, int(selected_end_index)))
 
         if end_index < start_index:
             start_index, end_index = end_index, start_index
@@ -459,8 +564,10 @@ class RelativeChart:
         _, _, start_center_x = self._pair_positions(start_index, LEFT_PAD, body_half, pair_gap, pair_width)
         _, _, end_center_x = self._pair_positions(end_index, LEFT_PAD, body_half, pair_gap, pair_width)
 
-        start_y = mid_y - float(divergence_series.iloc[start_index]) * scale
-        end_y = mid_y - float(divergence_series.iloc[end_index]) * scale
+        start_y_1 = mid_y - float(line_1.iloc[start_index]) * scale
+        start_y_2 = mid_y - float(line_2.iloc[start_index]) * scale
+        end_y_1 = mid_y - float(line_1.iloc[end_index]) * scale
+        end_y_2 = mid_y - float(line_2.iloc[end_index]) * scale
 
         if end_index > start_index:
             self.line_canvas.create_rectangle(
@@ -474,11 +581,13 @@ class RelativeChart:
             )
 
         self.line_canvas.create_line(start_center_x, 8, start_center_x, height - 8, fill="#22c55e", dash=(4, 3), width=2)
-        self._draw_marker(self.line_canvas, start_center_x, start_y, "#22c55e")
+        self._draw_marker(self.line_canvas, start_center_x, start_y_1, "#22c55e")
+        self._draw_marker(self.line_canvas, start_center_x, start_y_2, "#22c55e")
 
         if selected_end_index is not None:
             self.line_canvas.create_line(end_center_x, 8, end_center_x, height - 8, fill="#ef4444", dash=(4, 3), width=2)
-            self._draw_marker(self.line_canvas, end_center_x, end_y, "#ef4444")
+            self._draw_marker(self.line_canvas, end_center_x, end_y_1, "#ef4444")
+            self._draw_marker(self.line_canvas, end_center_x, end_y_2, "#ef4444")
 
     def _draw_pair_legend(self, symbol_1: str, symbol_2: str, x0: float, y0: float) -> None:
         row_h = 22
@@ -545,7 +654,7 @@ class RelativeChart:
                 self._draw_buy_arrow(float(point["p2_x"]), float(point["p2_low_y"]) + 18, buy_color, height)
 
     def _draw_sell_arrow(self, x: float, y: float, color: str) -> None:
-        y = max(92.0, y)
+        y = max(70.0, y)
         self.candle_canvas.create_text(x, y, anchor="s", fill=color, font=("Segoe UI", 12, "bold"), text="↓")
 
     def _draw_buy_arrow(self, x: float, y: float, color: str, height: int) -> None:

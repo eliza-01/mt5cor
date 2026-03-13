@@ -19,6 +19,9 @@ class UIState:
     refresh_ms: str = "250"
     aggregate_bars: str = "1"
     use_ratio_in_divergence: bool = False
+    auto_volume: bool = True
+    manual_lot_1: str = "0.10"
+    manual_lot_2: str = "0.10"
     width_adjust_px: int = 0
     height_adjust_px: int = 0
     pair_gap_adjust_px: int = 0
@@ -50,6 +53,9 @@ def load_ui_state(cfg: Settings) -> UIState:
             refresh_ms=str(raw.get("refresh_ms", "250") or "250"),
             aggregate_bars=str(raw.get("aggregate_bars", "1") or "1"),
             use_ratio_in_divergence=bool(raw.get("use_ratio_in_divergence", False)),
+            auto_volume=bool(raw.get("auto_volume", True)),
+            manual_lot_1=str(raw.get("manual_lot_1", "0.10") or "0.10"),
+            manual_lot_2=str(raw.get("manual_lot_2", "0.10") or "0.10"),
             width_adjust_px=int(raw.get("width_adjust_px", 0) or 0),
             height_adjust_px=int(raw.get("height_adjust_px", 0) or 0),
             pair_gap_adjust_px=int(raw.get("pair_gap_adjust_px", 0) or 0),
