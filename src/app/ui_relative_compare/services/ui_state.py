@@ -1,5 +1,3 @@
-# src/app/ui_relative_compare/services/ui_state.py
-# Saves and loads persistent UI state for the relative compare window.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -25,7 +23,15 @@ class UIState:
     width_adjust_px: int = 0
     height_adjust_px: int = 0
     pair_gap_adjust_px: int = 0
+    chart_split_y: int = 560
+    candle_collapsed: bool = False
+    line_collapsed: bool = False
+    pair_1_up_color: str = "#34d399"
+    pair_1_down_color: str = "#f87171"
+    pair_2_up_color: str = "#60a5fa"
+    pair_2_down_color: str = "#f59e0b"
     window_geometry: str = "1380x980"
+    line_zoom: float = 1.0
 
 
 def _state_path(cfg: Settings) -> Path:
@@ -59,7 +65,15 @@ def load_ui_state(cfg: Settings) -> UIState:
             width_adjust_px=int(raw.get("width_adjust_px", 0) or 0),
             height_adjust_px=int(raw.get("height_adjust_px", 0) or 0),
             pair_gap_adjust_px=int(raw.get("pair_gap_adjust_px", 0) or 0),
+            chart_split_y=int(raw.get("chart_split_y", 560) or 560),
+            candle_collapsed=bool(raw.get("candle_collapsed", False)),
+            line_collapsed=bool(raw.get("line_collapsed", False)),
+            pair_1_up_color=str(raw.get("pair_1_up_color", "#34d399") or "#34d399"),
+            pair_1_down_color=str(raw.get("pair_1_down_color", "#f87171") or "#f87171"),
+            pair_2_up_color=str(raw.get("pair_2_up_color", "#60a5fa") or "#60a5fa"),
+            pair_2_down_color=str(raw.get("pair_2_down_color", "#f59e0b") or "#f59e0b"),
             window_geometry=str(raw.get("window_geometry", "1380x980") or "1380x980"),
+            line_zoom=float(raw.get("line_zoom", 1.0) or 1.0),
         )
     except Exception:
         return UIState()

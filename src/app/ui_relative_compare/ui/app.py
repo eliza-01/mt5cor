@@ -1,24 +1,29 @@
-# src/app/ui_relative_compare/ui/app.py
-# Tk application for scrollable fixed-size relative candles, direct per-pair SELL/BUY buttons,
-# auto/manual volume mode, close-by-pair with PnL, persistent UI settings, interval selection stats,
-# and opposite-position opening.
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import colorchooser, messagebox, ttk
 
 from src.app.ui_relative_compare.constants import COMMON_SYMBOLS, TIMEFRAME_MINUTES
 from src.app.ui_relative_compare.models import RelativeMetrics, RenderSnapshot
-from src.app.ui_relative_compare.services.market import (
-    build_render_snapshot,
-    calculate_relative_metrics,
-    load_two_symbols,
-)
+from src.app.ui_relative_compare.services.market import build_render_snapshot, calculate_relative_metrics, load_two_symbols
 from src.app.ui_relative_compare.services.trading import close_pair_positions, open_pair_positions, reverse_pair_positions
 from src.app.ui_relative_compare.services.ui_state import UIState, load_ui_state, save_ui_state
 from src.app.ui_relative_compare.ui.chart import RelativeChart
 from src.broker.mt5_client import MT5Client
 from src.common.settings import load_settings
+
+
+ACTION_BG = "#111111"
+ACTION_TEXT = "#d4d4d4"
+BUY_BUTTON_BG = "#2563eb"
+SELL_BUTTON_BG = "#dc2626"
+NEUTRAL_BUTTON_BG = "#2f2f2f"
+MARKER_BORDER = "#3a3a3a"
+PANE_HEADER_BG = "#161616"
+PANE_BORDER = "#6b7280"
+PANE_MIN_EXPANDED_TOP = 220
+PANE_MIN_EXPANDED_BOTTOM = 140
+PANE_MIN_COLLAPSED = 32
 
 
 class RelativeCompareUI(tk.Tk):
@@ -54,6 +59,8 @@ class RelativeCompareUI(tk.Tk):
         self.manual_lot_2_label_var = tk.StringVar(value="Lot AUDUSD")
         self.header_symbol_1_var = tk.StringVar(value="EURO")
         self.header_symbol_2_var = tk.StringVar(value="AUD")
+        self.action_pair_1_var = tk.StringVar(value=self._normalize_symbol(self.saved_state.symbol_1))
+        self.action_pair_2_var = tk.StringVar(value=self._normalize_symbol(self.saved_state.symbol_2))
 
         self.status_var = tk.StringVar(value="idle")
         self.account_var = tk.StringVar(value="-")
@@ -72,10 +79,26 @@ class RelativeCompareUI(tk.Tk):
         self.width_adjust_px = int(self.saved_state.width_adjust_px)
         self.height_adjust_px = int(self.saved_state.height_adjust_px)
         self.pair_gap_adjust_px = int(self.saved_state.pair_gap_adjust_px)
+        self.chart_split_y = int(self.saved_state.chart_split_y)
+        self.candle_collapsed = bool(self.saved_state.candle_collapsed)
+        self.line_collapsed = bool(self.saved_state.line_collapsed)
 
         self.width_size_var = tk.StringVar(value=f"{self.width_adjust_px:+d}px")
         self.height_size_var = tk.StringVar(value=f"{self.height_adjust_px:+d}px")
         self.pair_gap_size_var = tk.StringVar(value=f"{self.pair_gap_adjust_px:+d}px")
+        self.candle_toggle_var = tk.StringVar()
+        self.line_toggle_var = tk.StringVar()
+
+        self.line_zoom_var = tk.DoubleVar(value=float(getattr(self.saved_state, "line_zoom", 1.0) or 1.0))
+
+        self.chart_colors: dict[str, str] = {
+            "pair_1_up": self.saved_state.pair_1_up_color,
+            "pair_1_down": self.saved_state.pair_1_down_color,
+            "pair_2_up": self.saved_state.pair_2_up_color,
+            "pair_2_down": self.saved_state.pair_2_down_color,
+        }
+        self.color_marker_widgets: dict[str, tk.Label] = {}
+        self.action_button_widgets: dict[str, tk.Button] = {}
 
         self.relative_metrics: RelativeMetrics | None = None
         self.current_snapshot: RenderSnapshot | None = None
@@ -90,7 +113,35 @@ class RelativeCompareUI(tk.Tk):
         self._bind_state_persistence()
         self._update_symbol_labels()
         self._update_manual_volume_state()
+        self._refresh_color_markers()
+        self._refresh_action_buttons()
+        self._update_pane_toggle_labels()
+        self.after(120, self._apply_chart_sections_layout)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _on_line_zoom_changed(self) -> None:
+        self._schedule_state_save()
+        if self.current_snapshot is not None:
+            self._redraw_current_snapshot()
+
+    def _on_line_zoom_wheel(self, event) -> str:
+        step = 0.2
+
+        if getattr(event, "num", None) == 4:
+            direction = 1
+        elif getattr(event, "num", None) == 5:
+            direction = -1
+        else:
+            delta = int(getattr(event, "delta", 0) or 0)
+            if delta == 0:
+                return "break"
+            direction = 1 if delta > 0 else -1
+
+        value = float(self.line_zoom_var.get() or 1.0) + direction * step
+        value = max(1.0, min(8.0, value))
+        self.line_zoom_var.set(value)
+        self._on_line_zoom_changed()
+        return "break"
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=12)
@@ -201,12 +252,10 @@ class RelativeCompareUI(tk.Tk):
         ttk.Label(
             hint,
             text=(
-                "Справа над графиком находятся прямые кнопки SELL/BUY для каждой пары. "
-                "Нажатие на кнопку всегда открывает противоположную позицию по второй паре. "
-                "Галочка 'Объем автоматически' оставляет текущую логику расчета объема. "
-                "При отключении можно задать объем отдельно для каждой пары вручную. "
-                "Кнопка 'Закрыть все' закрывает все позиции по двум выбранным символам. "
-                "Кнопка 'Развернуть' одновременно закрывает все позиции и открывает их в обратную сторону."
+                "Верхняя черная панель над графиком содержит кнопки открытия позиций и маркеры цветов. "
+                "По клику на цветовой маркер открывается выбор нового цвета, он сразу применяется и сохраняется. "
+                "Высота двух графиков меняется мышкой через разделитель между ними. "
+                "Кнопка 'Свернуть окно' минимизирует приложение в панель задач."
             ),
             wraplength=1300,
         ).pack(anchor="w")
@@ -238,44 +287,182 @@ class RelativeCompareUI(tk.Tk):
 
         charts_right = ttk.Frame(chart_layout)
         charts_right.pack(side="left", fill="both", expand=True)
-
         charts_right.columnconfigure(0, weight=1)
         charts_right.rowconfigure(1, weight=1)
-        charts_right.rowconfigure(2, weight=0)
-        charts_right.rowconfigure(3, weight=0)
 
-        self.chart_header = tk.Frame(charts_right, bg="#111111", height=42)
-        self.chart_header.grid(row=0, column=0, sticky="ew")
-        self.chart_header.grid_propagate(False)
+        self.action_bar = tk.Frame(charts_right, bg=ACTION_BG, height=78, highlightthickness=0, bd=0)
+        self.action_bar.grid(row=0, column=0, sticky="ew")
+        self.action_bar.grid_propagate(False)
 
-        header_inner = tk.Frame(self.chart_header, bg="#111111")
-        header_inner.pack(side="right", padx=(0, 10), pady=(8, 4))
+        legend_wrap = tk.Frame(self.action_bar, bg=ACTION_BG)
+        legend_wrap.pack(side="left", fill="y", padx=(10, 6))
 
-        self._make_header_label(header_inner, self.header_symbol_1_var).pack(side="left", padx=(0, 6))
-        self._make_px_button(header_inner, "SELL", lambda: self.open_direct_order(1, "sell"), 60, 25).pack(side="left", padx=(0, 4))
-        self._make_px_button(header_inner, "BUY", lambda: self.open_direct_order(1, "buy"), 60, 25).pack(side="left", padx=(0, 12))
+        self.legend_label_1 = self._make_action_label(legend_wrap, self.header_symbol_1_var)
+        self.legend_label_1.pack(side="left", padx=(0, 6))
+        self.color_marker_widgets["pair_1_up"] = self._make_color_marker(legend_wrap, "pair_1_up", "↑")
+        self.color_marker_widgets["pair_1_up"].pack(side="left", padx=(0, 4), pady=8)
+        self.color_marker_widgets["pair_1_down"] = self._make_color_marker(legend_wrap, "pair_1_down", "↓")
+        self.color_marker_widgets["pair_1_down"].pack(side="left", padx=(0, 14), pady=8)
 
-        self._make_header_label(header_inner, self.header_symbol_2_var).pack(side="left", padx=(0, 6))
-        self._make_px_button(header_inner, "SELL", lambda: self.open_direct_order(2, "sell"), 60, 25).pack(side="left", padx=(0, 4))
-        self._make_px_button(header_inner, "BUY", lambda: self.open_direct_order(2, "buy"), 60, 25).pack(side="left", padx=(0, 16))
+        self.legend_label_2 = self._make_action_label(legend_wrap, self.header_symbol_2_var)
+        self.legend_label_2.pack(side="left", padx=(0, 6))
+        self.color_marker_widgets["pair_2_up"] = self._make_color_marker(legend_wrap, "pair_2_up", "↑")
+        self.color_marker_widgets["pair_2_up"].pack(side="left", padx=(0, 4), pady=8)
+        self.color_marker_widgets["pair_2_down"] = self._make_color_marker(legend_wrap, "pair_2_down", "↓")
+        self.color_marker_widgets["pair_2_down"].pack(side="left", padx=(0, 10), pady=8)
 
-        self._make_px_button(header_inner, "ЗАКРЫТЬ ВСЕ", self.close_current_pair_positions, 110, 25).pack(side="left", padx=(0, 8))
-        self._make_px_button(header_inner, "РАЗВЕРНУТЬ", self.reverse_current_pair_positions, 110, 25).pack(side="left")
+        toolbar_right = tk.Frame(self.action_bar, bg=ACTION_BG)
+        toolbar_right.pack(side="right", padx=(6, 10), pady=6)
 
-        self.candle_canvas = tk.Canvas(charts_right, bg="#111111", highlightthickness=0)
-        self.candle_canvas.grid(row=1, column=0, sticky="nsew")
+        global_actions = tk.Frame(toolbar_right, bg=ACTION_BG)
+        global_actions.pack(side="right", padx=(12, 0), fill="y")
 
-        self.line_wrap = ttk.Frame(charts_right, height=180)
-        self.line_wrap.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        self.line_wrap.grid_propagate(False)
-        self.line_wrap.columnconfigure(0, weight=1)
-        self.line_wrap.rowconfigure(0, weight=1)
+        self._make_action_button(
+            global_actions,
+            "ЗАКРЫТЬ ВСЕ",
+            self.close_current_pair_positions,
+            NEUTRAL_BUTTON_BG,
+            112,
+            height_px=28,
+        ).pack(side="top", pady=(0, 6))
 
-        self.line_canvas = tk.Canvas(self.line_wrap, bg="#111111", highlightthickness=0, height=180)
-        self.line_canvas.grid(row=0, column=0, sticky="nsew")
+        self._make_action_button(
+            global_actions,
+            "РАЗВЕРНУТЬ",
+            self.reverse_current_pair_positions,
+            NEUTRAL_BUTTON_BG,
+            112,
+            height_px=28,
+        ).pack(side="top")
+
+        pair_actions = tk.Frame(toolbar_right, bg=ACTION_BG)
+        pair_actions.pack(side="right", padx=(0, 12), fill="y")
+
+        pair_1_row = tk.Frame(pair_actions, bg=ACTION_BG)
+        pair_1_row.pack(side="top", anchor="e", pady=(0, 6))
+        tk.Label(
+            pair_1_row,
+            textvariable=self.action_pair_1_var,
+            bg=ACTION_BG,
+            fg=ACTION_TEXT,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side="left", padx=(0, 8))
+
+        pair_1_col = tk.Frame(pair_1_row, bg=ACTION_BG)
+        pair_1_col.pack(side="left")
+        # BUY сверху, SELL снизу, отступ между ними
+        self._make_action_button(
+            pair_1_col,
+            "BUY",
+            lambda: self.open_direct_order(1, "buy"),
+            self.chart_colors["pair_1_up"],
+            66,
+            height_px=24,
+            store_key="pair_1_buy",
+        ).pack(side="top", pady=(0, 2))
+
+        self._make_action_button(
+            pair_1_col,
+            "SELL",
+            lambda: self.open_direct_order(1, "sell"),
+            self.chart_colors["pair_1_down"],
+            66,
+            height_px=24,
+            store_key="pair_1_sell",
+        ).pack(side="top")
+
+        pair_2_row = tk.Frame(pair_actions, bg=ACTION_BG)
+        pair_2_row.pack(side="top", anchor="e")
+        tk.Label(
+            pair_2_row,
+            textvariable=self.action_pair_2_var,
+            bg=ACTION_BG,
+            fg=ACTION_TEXT,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side="left", padx=(0, 8))
+
+        pair_2_col = tk.Frame(pair_2_row, bg=ACTION_BG)
+        pair_2_col.pack(side="left")
+        self._make_action_button(
+            pair_2_col,
+            "BUY",
+            lambda: self.open_direct_order(2, "buy"),
+            self.chart_colors["pair_2_up"],
+            66,
+            height_px=24,
+            store_key="pair_2_buy",
+        ).pack(side="top")
+        self._make_action_button(
+            pair_2_col,
+            "SELL",
+            lambda: self.open_direct_order(2, "sell"),
+            self.chart_colors["pair_2_down"],
+            66,
+            height_px=24,
+            store_key="pair_2_sell",
+        ).pack(side="top", pady=(0, 2))
+
+        self.chart_panes = self._make_paned_window(charts_right)
+        self.chart_panes.grid(row=1, column=0, sticky="nsew")
+
+        self.candle_wrap = tk.Frame(self.chart_panes, bg=ACTION_BG, highlightthickness=1, highlightbackground=PANE_BORDER, bd=0)
+        self.line_wrap = tk.Frame(self.chart_panes, bg=ACTION_BG, highlightthickness=1, highlightbackground=PANE_BORDER, bd=0)
+
+        self.candle_header = self._make_chart_panel_header(
+            self.candle_wrap,
+            title="Свечи",
+            indicator_var=self.candle_toggle_var,
+            command=self.toggle_candle_panel,
+        )
+        self.candle_header.pack(fill="x", side="top")
+        self.candle_body = tk.Frame(self.candle_wrap, bg=ACTION_BG, highlightthickness=0, bd=0)
+        self.candle_body.pack(fill="both", expand=True)
+        self.candle_canvas = tk.Canvas(self.candle_body, bg=ACTION_BG, highlightthickness=0)
+        self.candle_canvas.pack(fill="both", expand=True)
+
+        self.line_header = self._make_chart_panel_header(
+            self.line_wrap,
+            title="Средние скользящие",
+            indicator_var=self.line_toggle_var,
+            command=self.toggle_line_panel,
+        )
+        self.line_header.pack(fill="x", side="top")
+        self.line_body = tk.Frame(self.line_wrap, bg=ACTION_BG, highlightthickness=0, bd=0)
+        self.line_body.pack(fill="both", expand=True)
+        line_inner = tk.Frame(self.line_body, bg=ACTION_BG)
+        line_inner.pack(fill="both", expand=True)
+
+        self.line_zoom_scale = tk.Scale(
+            line_inner,
+            from_=8.0,
+            to=1.0,
+            resolution=0.1,
+            orient="vertical",
+            variable=self.line_zoom_var,
+            showvalue=0,
+            bg=ACTION_BG,
+            fg=ACTION_TEXT,
+            troughcolor="#0b0b0b",
+            highlightthickness=0,
+            bd=0,
+            sliderrelief="flat",
+            width=14,
+            cursor="hand2",
+            command=lambda _v: self._on_line_zoom_changed(),
+        )
+        self.line_zoom_scale.pack(side="left", fill="y", padx=(6, 6), pady=(6, 6))
+        self.line_zoom_scale.bind("<MouseWheel>", self._on_line_zoom_wheel)
+        self.line_zoom_scale.bind("<Button-4>", self._on_line_zoom_wheel)
+        self.line_zoom_scale.bind("<Button-5>", self._on_line_zoom_wheel)
+
+        self.line_canvas = tk.Canvas(line_inner, bg=ACTION_BG, highlightthickness=0)
+        self.line_canvas.pack(side="left", fill="both", expand=True)
+
+        self.chart_panes.add(self.candle_wrap, minsize=PANE_MIN_EXPANDED_TOP, stretch="always")
+        self.chart_panes.add(self.line_wrap, minsize=PANE_MIN_EXPANDED_BOTTOM, stretch="always")
 
         self.h_scroll = ttk.Scrollbar(charts_right, orient="horizontal", command=self._on_scrollbar)
-        self.h_scroll.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        self.h_scroll.grid(row=2, column=0, sticky="ew", pady=(8, 0))
 
         self.candle_canvas.configure(xscrollcommand=self._set_scrollbar)
         self.line_canvas.configure(xscrollcommand=self._set_scrollbar)
@@ -283,41 +470,202 @@ class RelativeCompareUI(tk.Tk):
         self.chart = RelativeChart(self.candle_canvas, self.line_canvas)
         self._bind_scroll_events()
 
-    def _make_header_label(self, parent: tk.Widget, text_var: tk.StringVar) -> tk.Label:
+    def _make_action_label(self, parent: tk.Widget, text_var: tk.StringVar) -> tk.Label:
         return tk.Label(
             parent,
             textvariable=text_var,
-            bg="#111111",
-            fg="#d4d4d4",
+            bg=ACTION_BG,
+            fg=ACTION_TEXT,
             font=("Segoe UI", 10, "bold"),
             padx=0,
             pady=0,
         )
 
-    def _make_px_button(
+    def _make_color_marker(self, parent: tk.Widget, color_key: str, arrow_text: str) -> tk.Label:
+        marker = tk.Label(
+            parent,
+            text=arrow_text,
+            width=2,
+            bg=self.chart_colors[color_key],
+            fg="#ffffff",
+            font=("Segoe UI", 9, "bold"),
+            relief="solid",
+            bd=1,
+            cursor="hand2",
+            padx=2,
+            pady=1,
+        )
+        marker.bind("<Button-1>", lambda _event, key=color_key: self.pick_color(key))
+        return marker
+
+    def _make_action_button(
         self,
         parent: tk.Widget,
         text: str,
         command,
+        bg_color: str,
         width_px: int,
-        height_px: int,
+        height_px: int = 28,
+        store_key: str | None = None,
     ) -> tk.Frame:
-        frame = tk.Frame(parent, width=width_px, height=height_px, bg="#111111", highlightthickness=0, bd=0)
+        frame = tk.Frame(parent, width=width_px, height=height_px, bg=ACTION_BG, highlightthickness=0, bd=0)
         frame.pack_propagate(False)
 
         button = tk.Button(
             frame,
             text=text,
             command=command,
+            bg=bg_color,
+            fg="#ffffff",
+            activebackground=bg_color,
+            activeforeground="#ffffff",
+            highlightthickness=0,
+            relief="flat",
+            bd=0,
             font=("Segoe UI", 8, "bold"),
-            relief="raised",
-            bd=1,
+            cursor="hand2",
             padx=0,
             pady=0,
-            cursor="hand2",
         )
         button.pack(fill="both", expand=True)
+        if store_key:
+            self.action_button_widgets[store_key] = button
         return frame
+
+    def _make_chart_panel_header(
+        self,
+        parent: tk.Widget,
+        title: str,
+        indicator_var: tk.StringVar,
+        command,
+    ) -> tk.Frame:
+        header = tk.Frame(parent, bg=PANE_HEADER_BG, height=PANE_MIN_COLLAPSED, highlightthickness=1, highlightbackground=PANE_BORDER, bd=0)
+        header.pack_propagate(False)
+
+        toggle = tk.Button(
+            header,
+            textvariable=indicator_var,
+            command=command,
+            bg=PANE_HEADER_BG,
+            fg=ACTION_TEXT,
+            activebackground=PANE_HEADER_BG,
+            activeforeground="#ffffff",
+            highlightthickness=0,
+            relief="flat",
+            bd=0,
+            font=("Segoe UI", 10, "bold"),
+            width=2,
+            cursor="hand2",
+            padx=0,
+            pady=0,
+        )
+        toggle.pack(side="left", padx=(6, 4), pady=2)
+
+        tk.Label(
+            header,
+            text=title,
+            bg=PANE_HEADER_BG,
+            fg=ACTION_TEXT,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side="left", padx=(0, 6))
+
+        return header
+
+    def _make_paned_window(self, parent: tk.Widget) -> tk.PanedWindow:
+        cfg_full = dict(
+            orient="vertical",
+            sashwidth=12,
+            sashpad=2,
+            bg=PANE_BORDER,
+            bd=0,
+            relief="flat",
+            opaqueresize=True,
+            sashrelief="raised",
+            sashcursor="sb_v_double_arrow",
+            showhandle=True,
+            handlesize=10,
+            handlepad=0,
+        )
+        try:
+            return tk.PanedWindow(parent, **cfg_full)
+        except tk.TclError:
+            cfg_safe = dict(
+                orient="vertical",
+                sashwidth=12,
+                sashpad=2,
+                bg=PANE_BORDER,
+                bd=0,
+                relief="flat",
+                opaqueresize=True,
+                sashrelief="raised",
+                sashcursor="sb_v_double_arrow",
+            )
+            return tk.PanedWindow(parent, **cfg_safe)
+
+    def _update_pane_toggle_labels(self) -> None:
+        self.candle_toggle_var.set("▸" if self.candle_collapsed else "▾")
+        self.line_toggle_var.set("▸" if self.line_collapsed else "▾")
+
+    def toggle_candle_panel(self) -> None:
+        if not self.candle_collapsed:
+            self.chart_split_y = self._current_chart_split_y()
+        self.candle_collapsed = not self.candle_collapsed
+        self._apply_chart_sections_layout()
+        self._schedule_state_save()
+
+    def toggle_line_panel(self) -> None:
+        if not self.line_collapsed:
+            self.chart_split_y = self._current_chart_split_y()
+        self.line_collapsed = not self.line_collapsed
+        self._apply_chart_sections_layout()
+        self._schedule_state_save()
+
+    def _set_panel_body_visible(self, panel_body: tk.Frame, visible: bool) -> None:
+        manager = str(panel_body.winfo_manager())
+        if visible:
+            if manager != "pack":
+                panel_body.pack(fill="both", expand=True)
+        elif manager == "pack":
+            panel_body.pack_forget()
+
+    def _apply_chart_sections_layout(self) -> None:
+        try:
+            self.update_idletasks()
+            self._update_pane_toggle_labels()
+
+            self._set_panel_body_visible(self.candle_body, not self.candle_collapsed)
+            self._set_panel_body_visible(self.line_body, not self.line_collapsed)
+
+            total_height = max(int(self.chart_panes.winfo_height()), 380)
+
+            candle_min = PANE_MIN_COLLAPSED if self.candle_collapsed else PANE_MIN_EXPANDED_TOP
+            line_min = PANE_MIN_COLLAPSED if self.line_collapsed else PANE_MIN_EXPANDED_BOTTOM
+
+            self.chart_panes.paneconfigure(
+                self.candle_wrap,
+                minsize=candle_min,
+                height=candle_min if self.candle_collapsed else max(candle_min, int(self.chart_split_y)),
+                stretch="never" if self.candle_collapsed else "always",
+            )
+            self.chart_panes.paneconfigure(
+                self.line_wrap,
+                minsize=line_min,
+                height=line_min if self.line_collapsed else max(line_min, total_height - int(self.chart_split_y)),
+                stretch="never" if self.line_collapsed else "always",
+            )
+
+            if self.candle_collapsed and self.line_collapsed:
+                split_y = PANE_MIN_COLLAPSED
+            elif self.candle_collapsed:
+                split_y = PANE_MIN_COLLAPSED
+            elif self.line_collapsed:
+                split_y = max(PANE_MIN_EXPANDED_TOP, total_height - PANE_MIN_COLLAPSED)
+            else:
+                split_y = max(PANE_MIN_EXPANDED_TOP, min(total_height - PANE_MIN_EXPANDED_BOTTOM, int(self.chart_split_y or int(total_height * 0.65))))
+
+            self.chart_panes.sash_place(0, 0, split_y)
+        except Exception:
+            return
 
     def _bind_state_persistence(self) -> None:
         tracked = [
@@ -332,6 +680,7 @@ class RelativeCompareUI(tk.Tk):
             self.auto_volume_var,
             self.manual_lot_1_var,
             self.manual_lot_2_var,
+            self.line_zoom_var,
         ]
         for var in tracked:
             var.trace_add("write", self._schedule_state_save)
@@ -342,10 +691,16 @@ class RelativeCompareUI(tk.Tk):
         self.manual_lot_2_var.trace_add("write", self._on_manual_volume_changed)
 
         self.bind("<Configure>", self._on_window_configure)
+        self.chart_panes.bind("<ButtonRelease-1>", self._on_chart_panes_release)
 
     def _on_window_configure(self, event) -> None:
         if event.widget is self:
             self._schedule_state_save()
+
+    def _on_chart_panes_release(self, _event) -> None:
+        if not self.candle_collapsed and not self.line_collapsed:
+            self.chart_split_y = self._current_chart_split_y()
+        self._schedule_state_save()
 
     def _schedule_state_save(self, *_args) -> None:
         if self.state_save_job is not None:
@@ -375,8 +730,61 @@ class RelativeCompareUI(tk.Tk):
             width_adjust_px=int(self.width_adjust_px),
             height_adjust_px=int(self.height_adjust_px),
             pair_gap_adjust_px=int(self.pair_gap_adjust_px),
+            chart_split_y=int(self.chart_split_y if (self.candle_collapsed or self.line_collapsed) else self._current_chart_split_y()),
+            candle_collapsed=bool(self.candle_collapsed),
+            line_collapsed=bool(self.line_collapsed),
+            pair_1_up_color=self.chart_colors["pair_1_up"],
+            pair_1_down_color=self.chart_colors["pair_1_down"],
+            pair_2_up_color=self.chart_colors["pair_2_up"],
+            pair_2_down_color=self.chart_colors["pair_2_down"],
             window_geometry=str(self.geometry()),
+            line_zoom=float(self.line_zoom_var.get()),
         )
+
+    def _current_chart_split_y(self) -> int:
+        try:
+            return int(float(self.chart_panes.sash_coord(0)[1]))
+        except Exception:
+            return int(self.chart_split_y)
+
+    def _restore_chart_split(self) -> None:
+        self._apply_chart_sections_layout()
+
+    def _refresh_color_markers(self) -> None:
+        for key, widget in self.color_marker_widgets.items():
+            widget.configure(bg=self.chart_colors[key], highlightbackground=MARKER_BORDER)
+
+    def _refresh_action_buttons(self) -> None:
+        mapping = {
+            "pair_1_sell": "pair_1_down",
+            "pair_1_buy": "pair_1_up",
+            "pair_2_sell": "pair_2_down",
+            "pair_2_buy": "pair_2_up",
+        }
+        for btn_key, color_key in mapping.items():
+            btn = self.action_button_widgets.get(btn_key)
+            if btn is None:
+                continue
+            color = self.chart_colors[color_key]
+            try:
+                btn.configure(bg=color, activebackground=color)
+            except Exception:
+                pass
+
+    def pick_color(self, color_key: str) -> None:
+        current = self.chart_colors[color_key]
+        selected = colorchooser.askcolor(color=current, title="Выбор цвета")
+        hex_color = selected[1]
+        if not hex_color:
+            return
+
+        self.chart_colors[color_key] = str(hex_color)
+        self._refresh_color_markers()
+        self._refresh_action_buttons()
+        self._refresh_action_buttons()
+        self._schedule_state_save()
+        if self.current_snapshot is not None:
+            self._redraw_current_snapshot()
 
     def _bind_scroll_events(self) -> None:
         for widget in (self.candle_canvas, self.line_canvas):
@@ -484,6 +892,8 @@ class RelativeCompareUI(tk.Tk):
         self.manual_lot_2_label_var.set(f"Lot {self._normalize_symbol(symbol_2)}")
         self.header_symbol_1_var.set(self._base_label(symbol_1))
         self.header_symbol_2_var.set(self._base_label(symbol_2))
+        self.action_pair_1_var.set(self._normalize_symbol(symbol_1))
+        self.action_pair_2_var.set(self._normalize_symbol(symbol_2))
 
     def _on_symbols_changed(self, *_args) -> None:
         self._update_symbol_labels()
@@ -551,20 +961,14 @@ class RelativeCompareUI(tk.Tk):
 
         if self.auto_volume_var.get():
             if self.current_snapshot is not None:
-                return (
-                    float(self.current_snapshot.trade_plan.symbol_1_lots),
-                    float(self.current_snapshot.trade_plan.symbol_2_lots),
-                )
+                return float(self.current_snapshot.trade_plan.symbol_1_lots), float(self.current_snapshot.trade_plan.symbol_2_lots)
 
             if self.relative_metrics is None:
                 if strict:
                     raise RuntimeError("Для авто-объема сначала нажми 'Рассчитать коэффициент'")
                 return self.base_cfg.base_lot_eurusd, self.base_cfg.base_lot_eurusd
 
-            return (
-                float(self.base_cfg.base_lot_eurusd),
-                float(self.base_cfg.base_lot_eurusd * self.relative_metrics.ratio_1_to_2),
-            )
+            return float(self.base_cfg.base_lot_eurusd), float(self.base_cfg.base_lot_eurusd * self.relative_metrics.ratio_1_to_2)
 
         try:
             return (
@@ -643,6 +1047,8 @@ class RelativeCompareUI(tk.Tk):
                 trade_plan=snapshot.trade_plan,
                 selected_start_index=self.selected_start_index,
                 selected_end_index=self.selected_end_index,
+                colors=self.chart_colors,
+                line_zoom=float(self.line_zoom_var.get()),
             )
 
             self.update_idletasks()
@@ -683,6 +1089,8 @@ class RelativeCompareUI(tk.Tk):
             trade_plan=self.current_snapshot.trade_plan,
             selected_start_index=self.selected_start_index,
             selected_end_index=self.selected_end_index,
+            colors=self.chart_colors,
+            line_zoom=float(self.line_zoom_var.get()),
         )
 
         self.update_idletasks()
@@ -764,9 +1172,7 @@ class RelativeCompareUI(tk.Tk):
 
         candles_distance = max(0, end_index - start_index)
 
-        self.selection_range_var.set(
-            f"{start_row['time']} -> {end_row['time']} | свечей между точками: {candles_distance}"
-        )
+        self.selection_range_var.set(f"{start_row['time']} -> {end_row['time']} | свечей между точками: {candles_distance}")
         self.selection_pair_1_var.set(f"{symbol_1}: {self._format_pips(move_1_pips)} pip")
         self.selection_pair_2_var.set(f"{symbol_2}: {self._format_pips(move_2_pips)} pip")
         self.selection_diff_var.set(f"diff: {self._format_pips(diff_pips)} pip")
@@ -914,10 +1320,7 @@ class RelativeCompareUI(tk.Tk):
 
             reopened_lines = []
             for leg in summary.reopened_legs:
-                reopened_lines.append(
-                    f"{leg.side.upper()} {leg.symbol} {leg.volume:.2f} "
-                    f"order={leg.order} retcode={leg.retcode}"
-                )
+                reopened_lines.append(f"{leg.side.upper()} {leg.symbol} {leg.volume:.2f} order={leg.order} retcode={leg.retcode}")
 
             messagebox.showinfo(
                 "Позиции развернуты",
@@ -926,8 +1329,7 @@ class RelativeCompareUI(tk.Tk):
                     f"Закрыто позиций: {summary.close_summary.closed_count}\n"
                     f"Сделок MT: {summary.close_summary.deals_count}\n"
                     f"MT total pnl: {summary.close_summary.total_pnl_usd:.2f}\n\n"
-                    f"Открыто в обратную сторону:\n"
-                    + "\n".join(reopened_lines)
+                    f"Открыто в обратную сторону:\n" + "\n".join(reopened_lines)
                 ),
             )
 

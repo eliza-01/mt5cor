@@ -1,21 +1,10 @@
-# src/app/ui_relative_compare/ui/chart.py
-# Draws a fixed-size scrollable candle tape and a synced two-line divergence chart below it.
 from __future__ import annotations
 
 import tkinter as tk
 
 import pandas as pd
 
-from src.app.ui_relative_compare.constants import (
-    CHART_AXIS,
-    CHART_BG,
-    CHART_GRID,
-    CHART_TEXT,
-    PAIR_1_DOWN,
-    PAIR_1_UP,
-    PAIR_2_DOWN,
-    PAIR_2_UP,
-)
+from src.app.ui_relative_compare.constants import CHART_AXIS, CHART_BG, CHART_GRID, CHART_TEXT
 from src.app.ui_relative_compare.models import DivergenceStats, TradePlan
 
 
@@ -45,6 +34,8 @@ class RelativeChart:
         trade_plan: TradePlan,
         selected_start_index: int | None,
         selected_end_index: int | None,
+        colors: dict[str, str],
+        line_zoom: float,
     ) -> None:
         _ = divergence_series
         _ = divergence_stats
@@ -60,6 +51,7 @@ class RelativeChart:
             trade_plan=trade_plan,
             selected_start_index=selected_start_index,
             selected_end_index=selected_end_index,
+            colors=colors,
         )
 
         line_1, line_2 = self._build_relative_line_series(bars, ratio_1_to_2)
@@ -73,6 +65,8 @@ class RelativeChart:
             pair_gap_adjust_px=pair_gap_adjust_px,
             selected_start_index=selected_start_index,
             selected_end_index=selected_end_index,
+            colors=colors,
+            line_zoom=line_zoom,
         )
 
     def get_index_at_x(
@@ -201,10 +195,11 @@ class RelativeChart:
         trade_plan: TradePlan,
         selected_start_index: int | None,
         selected_end_index: int | None,
+        colors: dict[str, str],
     ) -> None:
         self.candle_canvas.update_idletasks()
         viewport_width = max(self.candle_canvas.winfo_width(), 400)
-        height = max(self.candle_canvas.winfo_height(), 340)
+        height = max(self.candle_canvas.winfo_height(), 240)
 
         viewport_left = float(self.candle_canvas.canvasx(0))
         viewport_right = viewport_left + float(viewport_width)
@@ -222,7 +217,7 @@ class RelativeChart:
         center_y = height / 2
         left_pad = LEFT_PAD
         right_pad = RIGHT_PAD
-        top_pad = 92
+        top_pad = 56
         bottom_pad = 34
 
         n = len(bars)
@@ -260,8 +255,8 @@ class RelativeChart:
             p2_low_y = center_y - float(row["p2_low"]) * scale
             p2_close_y = center_y - float(row["p2_close"]) * scale
 
-            p1_color = PAIR_1_UP if float(row["close_1"]) >= float(row["open_1"]) else PAIR_1_DOWN
-            p2_color = PAIR_2_UP if float(row["close_2"]) >= float(row["open_2"]) else PAIR_2_DOWN
+            p1_color = colors["pair_1_up"] if float(row["close_1"]) >= float(row["open_1"]) else colors["pair_1_down"]
+            p2_color = colors["pair_2_up"] if float(row["close_2"]) >= float(row["open_2"]) else colors["pair_2_down"]
 
             self.candle_canvas.create_line(p1_x, p1_high_y, p1_x, p1_low_y, fill=p1_color, width=1)
             self.candle_canvas.create_line(p2_x, p2_high_y, p2_x, p2_low_y, fill=p2_color, width=1)
@@ -296,29 +291,19 @@ class RelativeChart:
         )
 
         title_x = viewport_left + viewport_width / 2.0
-        fixed_left_x = viewport_left + 16
-        fixed_right_x = viewport_right - 16
-
         self.candle_canvas.create_text(
             title_x,
-            10,
+            8,
             anchor="n",
             fill=CHART_TEXT,
             font=("Segoe UI", 10),
-            text="внутри пары без зазора, между парами регулируемый отступ, горизонтальный скролл",
+            text=f"{symbol_1} vs {symbol_2} | свечи рядом, без зеркала",
         )
 
-        self._draw_pair_legend(symbol_1, symbol_2, fixed_left_x, 10)
-        self._draw_trade_arrows(
-            last_points=last_points,
-            symbol_1=symbol_1,
-            symbol_2=symbol_2,
-            trade_plan=trade_plan,
-            height=height,
-        )
+        self._draw_trade_arrows(last_points=last_points, symbol_1=symbol_1, symbol_2=symbol_2, trade_plan=trade_plan, height=height)
 
         self.candle_canvas.create_text(
-            fixed_right_x,
+            viewport_right - 16,
             height - 10,
             anchor="se",
             fill=CHART_TEXT,
@@ -332,15 +317,17 @@ class RelativeChart:
         self.candle_canvas.configure(scrollregion=(0, 0, total_width, height))
 
     def _draw_relative_lines(
-        self,
-        line_1: pd.Series,
-        line_2: pd.Series,
-        symbol_1: str,
-        symbol_2: str,
-        width_adjust_px: int,
-        pair_gap_adjust_px: int,
-        selected_start_index: int | None,
-        selected_end_index: int | None,
+            self,
+            line_1: pd.Series,
+            line_2: pd.Series,
+            symbol_1: str,
+            symbol_2: str,
+            width_adjust_px: int,
+            pair_gap_adjust_px: int,
+            selected_start_index: int | None,
+            selected_end_index: int | None,
+            colors: dict[str, str],
+            line_zoom: float,
     ) -> None:
         self.line_canvas.update_idletasks()
         viewport_width = max(self.line_canvas.winfo_width(), 400)
@@ -378,11 +365,15 @@ class RelativeChart:
         usable_half = max(20.0, (height - top_pad - bottom_pad) / 2)
         scale = usable_half / (max_abs * 1.1)
 
+        zoom = float(line_zoom or 1.0)
+        zoom = max(0.2, min(8.0, zoom))
+        scale *= zoom
+
         self.line_canvas.create_line(left_pad, mid_y, total_width - right_pad, mid_y, fill=CHART_AXIS, width=1)
         self.line_canvas.create_text(12, mid_y, anchor="w", text="0", fill=CHART_AXIS, font=("Segoe UI", 9, "bold"))
 
         for level in [0.5, 1.0]:
-            dy = max_abs * scale * level
+            dy = max_abs * (usable_half / (max_abs * 1.1)) * level
             self.line_canvas.create_line(left_pad, mid_y - dy, total_width - right_pad, mid_y - dy, fill=CHART_GRID)
             self.line_canvas.create_line(left_pad, mid_y + dy, total_width - right_pad, mid_y + dy, fill=CHART_GRID)
 
@@ -399,14 +390,20 @@ class RelativeChart:
             points_2.extend([pair_center_x, y_2])
 
         if len(points_1) >= 4:
-            self.line_canvas.create_line(*points_1, fill=PAIR_1_UP, width=1, smooth=False)
+            self.line_canvas.create_line(*points_1, fill=colors["pair_1_up"], width=1, smooth=False)
         elif len(points_1) == 2:
-            self.line_canvas.create_oval(points_1[0] - 1, points_1[1] - 1, points_1[0] + 1, points_1[1] + 1, fill=PAIR_1_UP, outline=PAIR_1_UP)
+            self.line_canvas.create_oval(
+                points_1[0] - 1, points_1[1] - 1, points_1[0] + 1, points_1[1] + 1,
+                fill=colors["pair_1_up"], outline=colors["pair_1_up"]
+            )
 
         if len(points_2) >= 4:
-            self.line_canvas.create_line(*points_2, fill=PAIR_2_UP, width=1, smooth=False)
+            self.line_canvas.create_line(*points_2, fill=colors["pair_2_up"], width=1, smooth=False)
         elif len(points_2) == 2:
-            self.line_canvas.create_oval(points_2[0] - 1, points_2[1] - 1, points_2[0] + 1, points_2[1] + 1, fill=PAIR_2_UP, outline=PAIR_2_UP)
+            self.line_canvas.create_oval(
+                points_2[0] - 1, points_2[1] - 1, points_2[0] + 1, points_2[1] + 1,
+                fill=colors["pair_2_up"], outline=colors["pair_2_up"]
+            )
 
         self._draw_selection_on_line(
             line_1=line_1,
@@ -419,35 +416,6 @@ class RelativeChart:
             height=height,
             selected_start_index=selected_start_index,
             selected_end_index=selected_end_index,
-        )
-
-        left_text = f"{symbol_1}: тонкая линия"
-        right_text = f"{symbol_2}: тонкая линия"
-        title_text = "close→close, общий ход в одну сторону вычтен"
-
-        self.line_canvas.create_text(
-            viewport_left + 16,
-            6,
-            anchor="nw",
-            fill=CHART_TEXT,
-            font=("Segoe UI", 9, "bold"),
-            text=left_text,
-        )
-        self.line_canvas.create_text(
-            viewport_left + viewport_width / 2.0,
-            6,
-            anchor="n",
-            fill=CHART_TEXT,
-            font=("Segoe UI", 9),
-            text=title_text,
-        )
-        self.line_canvas.create_text(
-            viewport_right - 16,
-            6,
-            anchor="ne",
-            fill=CHART_TEXT,
-            font=("Segoe UI", 9, "bold"),
-            text=right_text,
         )
 
         self.line_canvas.configure(scrollregion=(0, 0, total_width, height))
@@ -589,43 +557,6 @@ class RelativeChart:
             self._draw_marker(self.line_canvas, end_center_x, end_y_1, "#ef4444")
             self._draw_marker(self.line_canvas, end_center_x, end_y_2, "#ef4444")
 
-    def _draw_pair_legend(self, symbol_1: str, symbol_2: str, x0: float, y0: float) -> None:
-        row_h = 22
-        box = 10
-
-        self.candle_canvas.create_text(
-            x0,
-            y0,
-            anchor="nw",
-            fill=CHART_TEXT,
-            font=("Segoe UI", 10, "bold"),
-            text="Цвета:",
-        )
-
-        y1 = y0 + 22
-        self.candle_canvas.create_rectangle(x0, y1, x0 + box, y1 + box, fill=PAIR_1_UP, outline=PAIR_1_UP)
-        self.candle_canvas.create_rectangle(x0 + 14, y1, x0 + 14 + box, y1 + box, fill=PAIR_1_DOWN, outline=PAIR_1_DOWN)
-        self.candle_canvas.create_text(
-            x0 + 32,
-            y1 + box / 2,
-            anchor="w",
-            fill=CHART_TEXT,
-            font=("Segoe UI", 9, "bold"),
-            text=f"{symbol_1}  up/down",
-        )
-
-        y2 = y1 + row_h
-        self.candle_canvas.create_rectangle(x0, y2, x0 + box, y2 + box, fill=PAIR_2_UP, outline=PAIR_2_UP)
-        self.candle_canvas.create_rectangle(x0 + 14, y2, x0 + 14 + box, y2 + box, fill=PAIR_2_DOWN, outline=PAIR_2_DOWN)
-        self.candle_canvas.create_text(
-            x0 + 32,
-            y2 + box / 2,
-            anchor="w",
-            fill=CHART_TEXT,
-            font=("Segoe UI", 9, "bold"),
-            text=f"{symbol_2}  up/down",
-        )
-
     def _draw_trade_arrows(
         self,
         last_points: list[dict[str, float]],
@@ -635,7 +566,7 @@ class RelativeChart:
         height: int,
     ) -> None:
         sell_color = "#ef4444"
-        buy_color = "#22c55e"
+        buy_color = "#2563eb"
 
         sell_is_p1 = trade_plan.sell_symbol == symbol_1
         buy_is_p1 = trade_plan.buy_symbol == symbol_1
@@ -654,7 +585,7 @@ class RelativeChart:
                 self._draw_buy_arrow(float(point["p2_x"]), float(point["p2_low_y"]) + 18, buy_color, height)
 
     def _draw_sell_arrow(self, x: float, y: float, color: str) -> None:
-        y = max(70.0, y)
+        y = max(50.0, y)
         self.candle_canvas.create_text(x, y, anchor="s", fill=color, font=("Segoe UI", 12, "bold"), text="↓")
 
     def _draw_buy_arrow(self, x: float, y: float, color: str, height: int) -> None:
