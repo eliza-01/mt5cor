@@ -1,0 +1,4 @@
+CHART_BG = "#111111"
+CHART_GRID = "#2a2a2a"
+CHART_AXIS = "#8a8a8a"
+CHART_TEXT = "#d4d4d4"

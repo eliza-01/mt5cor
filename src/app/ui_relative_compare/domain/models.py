@@ -1,5 +1,3 @@
-# src/app/ui_relative_compare/models.py
-# Dataclasses for metrics, render snapshot, divergence stats, and trade plan.
 from __future__ import annotations
 
 from dataclasses import dataclass

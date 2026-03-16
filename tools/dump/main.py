@@ -61,11 +61,6 @@ INCLUDE_FILES: List[str] = [
     "README.md",
     "requirements.txt",
 
-    "fxrelval_mt5/.env.example",
-    "fxrelval_mt5/.gitignore",
-    "fxrelval_mt5/pyproject.toml",
-    "fxrelval_mt5/README.md",
-    "fxrelval_mt5/requirements.txt",
 ]
 
 # Директории, которые НИКОГДА не кладём в дамп (по относительному пути от корня проекта).
