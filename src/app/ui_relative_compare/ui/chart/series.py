@@ -2,36 +2,30 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .layout import EPS
+from src.app.ui_relative_compare.services.market.transform import transform_price_delta_to_pips
 
 
-def estimate_pip_size(price_delta: pd.Series, scaled_delta: pd.Series, factor: float, default: float) -> float:
-    candidates: list[float] = []
-    for raw_delta, scaled in zip(price_delta.tolist(), scaled_delta.tolist()):
-        raw_value = float(raw_delta)
-        scaled_value = float(scaled)
-        if abs(raw_value) <= EPS or abs(scaled_value) <= EPS:
-            continue
-        candidates.append(abs((raw_value * factor) / scaled_value))
-
-    if not candidates:
-        return default
-    candidates.sort()
-    return float(candidates[len(candidates) // 2])
-
-
-def build_relative_line_series(bars: pd.DataFrame, ratio_1_to_2: float) -> tuple[pd.Series, pd.Series]:
+def build_relative_line_series(
+    bars: pd.DataFrame,
+    digits_1: int,
+    digits_2: int,
+    ratio_1_to_2: float,
+    invert_second: bool,
+    mutual_exclusion_enabled: bool,
+) -> tuple[pd.Series, pd.Series]:
     if bars.empty:
         return pd.Series(dtype=float), pd.Series(dtype=float)
 
-    raw_delta_1 = (bars["close_1"] - bars["open_1"]).astype(float)
-    raw_delta_2 = (bars["close_2"] - bars["open_2"]).astype(float)
-
-    pip_1 = estimate_pip_size(raw_delta_1, bars["p1_close"].astype(float), factor=1.0, default=0.0001)
-    pip_2 = estimate_pip_size(raw_delta_2, bars["p2_close"].astype(float), factor=max(float(ratio_1_to_2), EPS), default=0.0001)
-
-    close_to_close_1 = bars["close_1"].astype(float).diff().fillna(0.0) / pip_1
-    close_to_close_2 = bars["close_2"].astype(float).diff().fillna(0.0) / pip_2
+    close_to_close_1 = transform_price_delta_to_pips(
+        bars["close_1"].astype(float).diff().fillna(0.0),
+        digits_1,
+    )
+    close_to_close_2 = transform_price_delta_to_pips(
+        bars["close_2"].astype(float).diff().fillna(0.0),
+        digits_2,
+        ratio_1_to_2,
+        invert_second,
+    )
 
     out_1 = [0.0]
     out_2 = [0.0]
@@ -41,11 +35,13 @@ def build_relative_line_series(bars: pd.DataFrame, ratio_1_to_2: float) -> tuple
     for i in range(1, len(bars)):
         move_1 = float(close_to_close_1.iloc[i])
         move_2 = float(close_to_close_2.iloc[i])
-        if move_1 * move_2 > 0:
+
+        if mutual_exclusion_enabled and move_1 * move_2 > 0:
             common = min(abs(move_1), abs(move_2))
             direction = 1.0 if move_1 > 0 else -1.0
             move_1 -= direction * common
             move_2 -= direction * common
+
         acc_1 += move_1
         acc_2 += move_2
         out_1.append(acc_1)

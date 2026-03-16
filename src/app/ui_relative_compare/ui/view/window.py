@@ -23,12 +23,13 @@ class RelativeCompareWindow(tk.Tk):
         self.symbol_1_var = tk.StringVar(value=saved_state.symbol_1)
         self.symbol_2_var = tk.StringVar(value=saved_state.symbol_2)
         self.timeframe_var = tk.StringVar(value=saved_state.timeframe)
-        self.calc_bars_var = tk.StringVar(value=saved_state.calc_bars)
         self.visible_bars_var = tk.StringVar(value=saved_state.visible_bars)
         self.refresh_ms_var = tk.StringVar(value=saved_state.refresh_ms)
         self.aggregate_bars_var = tk.StringVar(value=saved_state.aggregate_bars)
         self.aggregate_info_var = tk.StringVar(value=f"{saved_state.timeframe} x {saved_state.aggregate_bars}")
-        self.use_ratio_in_divergence_var = tk.BooleanVar(value=saved_state.use_ratio_in_divergence)
+        self.manual_ratio_1_to_2_var = tk.StringVar(value=saved_state.manual_ratio_1_to_2)
+        self.negative_correlation_var = tk.BooleanVar(value=saved_state.negative_correlation)
+        self.mutual_exclusion_var = tk.BooleanVar(value=saved_state.mutual_exclusion_enabled)
 
         self.auto_volume_var = tk.BooleanVar(value=saved_state.auto_volume)
         self.manual_lot_1_var = tk.StringVar(value=saved_state.manual_lot_1)
@@ -42,10 +43,6 @@ class RelativeCompareWindow(tk.Tk):
 
         self.status_var = tk.StringVar(value="idle")
         self.account_var = tk.StringVar(value="-")
-        self.ppm_1_var = tk.StringVar(value="-")
-        self.ppm_2_var = tk.StringVar(value="-")
-        self.ratio_1_to_2_var = tk.StringVar(value="-")
-        self.ratio_2_to_1_var = tk.StringVar(value="-")
         self.last_bar_time_var = tk.StringVar(value="-")
         self.trade_hint_var = tk.StringVar(value="-")
 

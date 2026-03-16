@@ -26,15 +26,13 @@ def build_info_blocks(window, parent) -> None:
 
     ttk.Button(sizing, text="Сбросить", command=window.controller.reset_size).grid(row=0, column=12, sticky="w")
 
-    info = ttk.LabelFrame(parent, text="Метрика относительности", padding=10)
+    info = ttk.LabelFrame(parent, text="Текущие параметры", padding=10)
     info.pack(fill="x", pady=(10, 0))
     kv(info, 0, 0, "Статус", window.status_var)
     kv(info, 0, 2, "Аккаунт", window.account_var)
     kv(info, 0, 4, "Последний бар", window.last_bar_time_var)
-    kv(info, 1, 0, "Пара 1 ппм", window.ppm_1_var)
-    kv(info, 1, 2, "Пара 2 ппм", window.ppm_2_var)
-    kv(info, 1, 4, "Коэф 1/2", window.ratio_1_to_2_var)
-    kv(info, 1, 6, "Коэф 2/1", window.ratio_2_to_1_var)
+    kv(info, 1, 0, "Коэф 1/2", window.manual_ratio_1_to_2_var)
+    kv(info, 1, 2, "Сборка", window.aggregate_info_var)
 
     trade = ttk.LabelFrame(parent, text="Текущая логика и объем", padding=10)
     trade.pack(fill="x", pady=(10, 0))

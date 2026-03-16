@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from src.app.ui_relative_compare.domain import RelativeMetrics, RenderSnapshot, SelectionState
+from src.app.ui_relative_compare.domain import RenderSnapshot, SelectionState
 from src.app.ui_relative_compare.services.ui_state import load_ui_state
 from src.app.ui_relative_compare.ui.chart import RelativeChart
 from src.common.settings import load_settings
@@ -13,7 +13,14 @@ from .trade import ControllerTradeMixin
 from ..view.window import RelativeCompareWindow
 
 
-class RelativeCompareController(ControllerStateMixin, ControllerLayoutMixin, ControllerSelectionMixin, ControllerRenderMixin, ControllerTradeMixin, ControllerLifecycleMixin):
+class RelativeCompareController(
+    ControllerStateMixin,
+    ControllerLayoutMixin,
+    ControllerSelectionMixin,
+    ControllerRenderMixin,
+    ControllerTradeMixin,
+    ControllerLifecycleMixin,
+):
     def __init__(self) -> None:
         self.base_cfg = load_settings()
         self.saved_state = load_ui_state(self.base_cfg)
@@ -23,7 +30,6 @@ class RelativeCompareController(ControllerStateMixin, ControllerLayoutMixin, Con
         self.connected = False
         self.live_job: str | None = None
         self.state_save_job: str | None = None
-        self.relative_metrics: RelativeMetrics | None = None
         self.current_snapshot: RenderSnapshot | None = None
         self.selection = SelectionState()
 

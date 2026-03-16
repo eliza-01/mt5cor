@@ -10,7 +10,21 @@ from .primitives import draw_body, draw_buy_arrow, draw_sell_arrow
 from .selection import draw_selection_on_candles
 
 
-def render_candles(canvas: tk.Canvas, bars: pd.DataFrame, symbol_1: str, symbol_2: str, ratio_1_to_2: float, width_adjust_px: int, height_adjust_px: int, pair_gap_adjust_px: int, trade_plan: TradePlan, selected_start_index: int | None, selected_end_index: int | None, colors: dict[str, str]) -> None:
+def render_candles(
+    canvas: tk.Canvas,
+    bars: pd.DataFrame,
+    symbol_1: str,
+    symbol_2: str,
+    ratio_1_to_2: float,
+    invert_second: bool,
+    width_adjust_px: int,
+    height_adjust_px: int,
+    pair_gap_adjust_px: int,
+    trade_plan: TradePlan,
+    selected_start_index: int | None,
+    selected_end_index: int | None,
+    colors: dict[str, str],
+) -> None:
     canvas.update_idletasks()
     viewport_width = max(canvas.winfo_width(), 400)
     height = max(canvas.winfo_height(), 240)
@@ -56,8 +70,8 @@ def render_candles(canvas: tk.Canvas, bars: pd.DataFrame, symbol_1: str, symbol_
         p2_low_y = center_y - float(row["p2_low"]) * scale
         p2_close_y = center_y - float(row["p2_close"]) * scale
 
-        p1_color = colors["pair_1_up"] if float(row["close_1"]) >= float(row["open_1"]) else colors["pair_1_down"]
-        p2_color = colors["pair_2_up"] if float(row["close_2"]) >= float(row["open_2"]) else colors["pair_2_down"]
+        p1_color = colors["pair_1_up"] if float(row["p1_close"]) >= 0 else colors["pair_1_down"]
+        p2_color = colors["pair_2_up"] if float(row["p2_close"]) >= 0 else colors["pair_2_down"]
 
         canvas.create_line(p1_x, p1_high_y, p1_x, p1_low_y, fill=p1_color, width=1)
         canvas.create_line(p2_x, p2_high_y, p2_x, p2_low_y, fill=p2_color, width=1)
@@ -65,12 +79,42 @@ def render_candles(canvas: tk.Canvas, bars: pd.DataFrame, symbol_1: str, symbol_
         draw_body(canvas, p2_x, center_y, p2_close_y, layout.body_half, p2_color)
 
         if i >= max(0, n - 2):
-            last_points.append({"p1_x": p1_x, "p2_x": p2_x, "p1_high_y": p1_high_y, "p1_low_y": p1_low_y, "p2_high_y": p2_high_y, "p2_low_y": p2_low_y})
+            last_points.append(
+                {
+                    "p1_x": p1_x,
+                    "p2_x": p2_x,
+                    "p1_high_y": p1_high_y,
+                    "p1_low_y": p1_low_y,
+                    "p2_high_y": p2_high_y,
+                    "p2_low_y": p2_low_y,
+                }
+            )
 
-    draw_selection_on_candles(canvas=canvas, bars=bars, body_half=layout.body_half, pair_gap=layout.pair_gap, pair_width=layout.pair_width, center_y=center_y, scale=scale, height=height, top_pad=top_pad, bottom_pad=bottom_pad, selected_start_index=selected_start_index, selected_end_index=selected_end_index)
+    draw_selection_on_candles(
+        canvas=canvas,
+        bars=bars,
+        body_half=layout.body_half,
+        pair_gap=layout.pair_gap,
+        pair_width=layout.pair_width,
+        center_y=center_y,
+        scale=scale,
+        height=height,
+        top_pad=top_pad,
+        bottom_pad=bottom_pad,
+        selected_start_index=selected_start_index,
+        selected_end_index=selected_end_index,
+    )
 
+    mode_text = "обратная 2-я пара" if invert_second else "обычная 2-я пара"
     title_x = viewport_left + viewport_width / 2.0
-    canvas.create_text(title_x, 8, anchor="n", fill=CHART_TEXT, font=("Segoe UI", 10), text=f"{symbol_1} vs {symbol_2} | свечи рядом, без зеркала")
+    canvas.create_text(
+        title_x,
+        8,
+        anchor="n",
+        fill=CHART_TEXT,
+        font=("Segoe UI", 10),
+        text=f"{symbol_1} vs {symbol_2} | {mode_text}",
+    )
 
     sell_color = "#ef4444"
     buy_color = "#2563eb"
@@ -84,5 +128,15 @@ def render_candles(canvas: tk.Canvas, bars: pd.DataFrame, symbol_1: str, symbol_
         if trade_plan.buy_symbol == symbol_2:
             draw_buy_arrow(canvas, float(point["p2_x"]), float(point["p2_low_y"]) + 18, buy_color, height)
 
-    canvas.create_text(viewport_right - 16, height - 10, anchor="se", fill=CHART_TEXT, font=("Segoe UI", 9), text=f"{symbol_2} | scale coef 1/2 = {ratio_1_to_2:.6f} | width={width_adjust_px:+d}px | height={height_adjust_px:+d}px | pair_gap={pair_gap_adjust_px:+d}px")
+    canvas.create_text(
+        viewport_right - 16,
+        height - 10,
+        anchor="se",
+        fill=CHART_TEXT,
+        font=("Segoe UI", 9),
+        text=(
+            f"{symbol_2} | coef 1/2 = {ratio_1_to_2:.6f} | "
+            f"width={width_adjust_px:+d}px | height={height_adjust_px:+d}px | pair_gap={pair_gap_adjust_px:+d}px"
+        ),
+    )
     canvas.configure(scrollregion=(0, 0, total_width, height))

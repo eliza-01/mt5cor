@@ -23,8 +23,14 @@ def load_ui_state(cfg: Settings) -> UIState:
     except Exception:
         return UIState()
 
+    if not isinstance(raw, dict):
+        return UIState()
+
+    defaults = asdict(UIState())
+    merged = {key: raw.get(key, default_value) for key, default_value in defaults.items()}
+
     try:
-        return UIState(**{**asdict(UIState()), **raw})
+        return UIState(**merged)
     except Exception:
         return UIState()
 

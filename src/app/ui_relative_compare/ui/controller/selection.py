@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from .helpers import format_pips, format_symbol_for_stats, pip_size
+from src.app.ui_relative_compare.services.market.transform import transform_price_delta_to_pips
+from .helpers import format_pips, format_symbol_for_stats
 
 
 class ControllerSelectionMixin:
@@ -66,7 +67,12 @@ class ControllerSelectionMixin:
             return
         canvas = self.view.candle_canvas if widget is self.view.candle_canvas else self.view.line_canvas
         x_world = float(canvas.canvasx(x_local))
-        index = self.chart.get_index_at_x(bars_count=len(self.current_snapshot.bars), x_world=x_world, width_adjust_px=self.view.width_adjust_px, pair_gap_adjust_px=self.view.pair_gap_adjust_px)
+        index = self.chart.get_index_at_x(
+            bars_count=len(self.current_snapshot.bars),
+            x_world=x_world,
+            width_adjust_px=self.view.width_adjust_px,
+            pair_gap_adjust_px=self.view.pair_gap_adjust_px,
+        )
         if index is None:
             return
         self.selection.register_click(self.current_snapshot.bars, index)
@@ -100,8 +106,20 @@ class ControllerSelectionMixin:
             self.view.selection_diff_var.set("-")
             return
 
-        move_1_pips = (float(end_row["close_1"]) - float(start_row["close_1"])) / pip_size(self.current_snapshot.digits_1)
-        move_2_pips = (float(end_row["close_2"]) - float(start_row["close_2"])) / pip_size(self.current_snapshot.digits_2)
+        move_1_pips = float(
+            transform_price_delta_to_pips(
+                float(end_row["close_1"]) - float(start_row["close_1"]),
+                self.current_snapshot.digits_1,
+            )
+        )
+        move_2_pips = float(
+            transform_price_delta_to_pips(
+                float(end_row["close_2"]) - float(start_row["close_2"]),
+                self.current_snapshot.digits_2,
+                self.current_snapshot.ratio_1_to_2,
+                self.current_snapshot.negative_correlation,
+            )
+        )
         diff_pips = move_1_pips - move_2_pips
         candles_distance = max(0, end_index - start_index)
 

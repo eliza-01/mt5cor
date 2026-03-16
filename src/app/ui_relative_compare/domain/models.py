@@ -6,14 +6,6 @@ import pandas as pd
 
 
 @dataclass(slots=True)
-class RelativeMetrics:
-    ppm_1: float
-    ppm_2: float
-    ratio_1_to_2: float
-    ratio_2_to_1: float
-
-
-@dataclass(slots=True)
 class DivergenceStats:
     total_diff_pips: float
     current_bar_diff_pips: float
@@ -38,9 +30,10 @@ class TradePlan:
 @dataclass(slots=True)
 class RenderSnapshot:
     bars: pd.DataFrame
-    metrics: RelativeMetrics
     divergence_stats: DivergenceStats
     divergence_series: pd.Series
     trade_plan: TradePlan
     digits_1: int
     digits_2: int
+    ratio_1_to_2: float
+    negative_correlation: bool

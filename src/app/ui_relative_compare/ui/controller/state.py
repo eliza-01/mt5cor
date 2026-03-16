@@ -9,7 +9,21 @@ from .helpers import base_label, normalize_symbol
 
 class ControllerStateMixin:
     def bind_state_persistence(self) -> None:
-        tracked = [self.view.symbol_1_var, self.view.symbol_2_var, self.view.timeframe_var, self.view.calc_bars_var, self.view.visible_bars_var, self.view.refresh_ms_var, self.view.aggregate_bars_var, self.view.use_ratio_in_divergence_var, self.view.auto_volume_var, self.view.manual_lot_1_var, self.view.manual_lot_2_var, self.view.line_zoom_var]
+        tracked = [
+            self.view.symbol_1_var,
+            self.view.symbol_2_var,
+            self.view.timeframe_var,
+            self.view.visible_bars_var,
+            self.view.refresh_ms_var,
+            self.view.aggregate_bars_var,
+            self.view.manual_ratio_1_to_2_var,
+            self.view.negative_correlation_var,
+            self.view.mutual_exclusion_var,
+            self.view.auto_volume_var,
+            self.view.manual_lot_1_var,
+            self.view.manual_lot_2_var,
+            self.view.line_zoom_var,
+        ]
         for var in tracked:
             var.trace_add("write", self.schedule_state_save)
 
@@ -17,6 +31,7 @@ class ControllerStateMixin:
         self.view.symbol_2_var.trace_add("write", self.on_symbols_changed)
         self.view.manual_lot_1_var.trace_add("write", self.on_manual_volume_changed)
         self.view.manual_lot_2_var.trace_add("write", self.on_manual_volume_changed)
+        self.view.manual_ratio_1_to_2_var.trace_add("write", self.on_manual_ratio_changed)
 
         self.view.bind("<Configure>", self.on_window_configure)
         self.view.chart_panes.bind("<ButtonRelease-1>", self.on_chart_panes_release)
@@ -47,11 +62,12 @@ class ControllerStateMixin:
             symbol_1=self.view.symbol_1_var.get().strip() or "EURUSD",
             symbol_2=self.view.symbol_2_var.get().strip() or "AUDUSD",
             timeframe=self.view.timeframe_var.get().strip() or "M1",
-            calc_bars=self.view.calc_bars_var.get().strip() or "1440",
             visible_bars=self.view.visible_bars_var.get().strip() or "120",
             refresh_ms=self.view.refresh_ms_var.get().strip() or "250",
             aggregate_bars=self.view.aggregate_bars_var.get().strip() or "1",
-            use_ratio_in_divergence=bool(self.view.use_ratio_in_divergence_var.get()),
+            manual_ratio_1_to_2=self.view.manual_ratio_1_to_2_var.get().strip() or "1.000000",
+            negative_correlation=bool(self.view.negative_correlation_var.get()),
+            mutual_exclusion_enabled=bool(self.view.mutual_exclusion_var.get()),
             auto_volume=bool(self.view.auto_volume_var.get()),
             manual_lot_1=self.view.manual_lot_1_var.get().strip() or "0.10",
             manual_lot_2=self.view.manual_lot_2_var.get().strip() or "0.10",
@@ -74,7 +90,12 @@ class ControllerStateMixin:
             widget.configure(bg=self.view.chart_colors[key], highlightbackground=MARKER_BORDER)
 
     def refresh_action_buttons(self) -> None:
-        mapping = {"pair_1_sell": "pair_1_down", "pair_1_buy": "pair_1_up", "pair_2_sell": "pair_2_down", "pair_2_buy": "pair_2_up"}
+        mapping = {
+            "pair_1_sell": "pair_1_down",
+            "pair_1_buy": "pair_1_up",
+            "pair_2_sell": "pair_2_down",
+            "pair_2_buy": "pair_2_up",
+        }
         for btn_key, color_key in mapping.items():
             btn = self.view.action_button_widgets.get(btn_key)
             if btn is None:
@@ -115,6 +136,9 @@ class ControllerStateMixin:
     def on_manual_volume_changed(self, *_args) -> None:
         if not self.view.auto_volume_var.get():
             self.update_trade_hint()
+
+    def on_manual_ratio_changed(self, *_args) -> None:
+        self.update_trade_hint()
 
     def update_manual_volume_state(self) -> None:
         state = "disabled" if self.view.auto_volume_var.get() else "normal"

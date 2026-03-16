@@ -6,8 +6,6 @@ from tkinter import messagebox
 class ControllerLifecycleMixin:
     def start_live(self) -> None:
         try:
-            if self.relative_metrics is None:
-                raise RuntimeError("Сначала нажми 'Рассчитать коэффициент'")
             self.stop_live()
             self.view.status_var.set("live")
             self.live_tick()
@@ -22,7 +20,7 @@ class ControllerLifecycleMixin:
             pass
         finally:
             try:
-                _, _, _, _, _, refresh_ms, _ = self.read_inputs()
+                _, _, _, _, refresh_ms, _ = self.read_inputs()
             except Exception:
                 refresh_ms = 250
             self.live_job = self.view.after(refresh_ms, self.live_tick)

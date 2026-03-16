@@ -8,11 +8,12 @@ class UIState:
     symbol_1: str = "EURUSD"
     symbol_2: str = "AUDUSD"
     timeframe: str = "M1"
-    calc_bars: str = "1440"
     visible_bars: str = "120"
     refresh_ms: str = "250"
     aggregate_bars: str = "1"
-    use_ratio_in_divergence: bool = False
+    manual_ratio_1_to_2: str = "1.000000"
+    negative_correlation: bool = False
+    mutual_exclusion_enabled: bool = True
     auto_volume: bool = True
     manual_lot_1: str = "0.10"
     manual_lot_2: str = "0.10"
