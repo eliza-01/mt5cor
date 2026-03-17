@@ -4,10 +4,10 @@ import tkinter as tk
 
 import pandas as pd
 
-from src.app.ui_relative_compare.domain import SignalDiagnostics, TradePlan
-from .candles import render_candles
+from src.app.ui_relative_compare.domain.models import FlowDiagnostics, LiveTailSnapshot, RangeStats, TradePlan
+from .candles import render_candles, update_live_tail_on_candles
 from .layout import LEFT_PAD, pair_layout
-from .lines import render_relative_lines
+from .lines import render_relative_lines, update_live_tail_on_lines
 from .series import build_signal_line_series
 
 
@@ -34,13 +34,10 @@ class RelativeChart:
         digits_1: int,
         digits_2: int,
         mutual_exclusion_enabled: bool,
-        signal_diagnostics: SignalDiagnostics,
-        line_chart_mode: str,
+        range_stats: RangeStats,
+        flow_diagnostics: FlowDiagnostics,
+        live_tail: LiveTailSnapshot | None,
     ) -> None:
-        aggregate_progress_text = None
-        if not bars.empty and "agg_progress" in bars.columns:
-            aggregate_progress_text = str(bars.iloc[-1]["agg_progress"])
-
         render_candles(
             canvas=self.candle_canvas,
             bars=bars,
@@ -55,35 +52,76 @@ class RelativeChart:
             selected_start_index=selected_start_index,
             selected_end_index=selected_end_index,
             colors=colors,
-            aggregate_progress_text=aggregate_progress_text,
+            live_tail=live_tail,
         )
 
-        gap, fast_ma, slow_ma = build_signal_line_series(
-            bars,
+        line_1, line_2, diff, _, _ = build_signal_line_series(
+            bars=bars,
             digits_1=digits_1,
             digits_2=digits_2,
-            ratio_1_to_2=ratio_1_to_2,
             invert_second=invert_second,
             mutual_exclusion_enabled=mutual_exclusion_enabled,
-            fast_window=signal_diagnostics.fast_window,
-            slow_window=signal_diagnostics.slow_window,
+            range_stats=range_stats,
         )
-
         render_relative_lines(
             canvas=self.line_canvas,
-            gap=gap,
-            fast_ma=fast_ma,
-            slow_ma=slow_ma,
+            line_1=line_1,
+            line_2=line_2,
+            diff=diff,
             width_adjust_px=width_adjust_px,
             pair_gap_adjust_px=pair_gap_adjust_px,
             selected_start_index=selected_start_index,
             selected_end_index=selected_end_index,
             colors=colors,
             line_zoom=line_zoom,
-            entry_threshold=signal_diagnostics.entry_threshold,
-            exit_threshold=signal_diagnostics.exit_threshold,
-            chart_mode=line_chart_mode,
-            aggregate_progress_text=aggregate_progress_text,
+            flow_diagnostics=flow_diagnostics,
+            live_tail=live_tail,
+        )
+
+    def update_live_tail(
+        self,
+        bars: pd.DataFrame,
+        trade_plan: TradePlan,
+        live_tail: LiveTailSnapshot | None,
+        width_adjust_px: int,
+        height_adjust_px: int,
+        pair_gap_adjust_px: int,
+        line_zoom: float,
+        digits_1: int,
+        digits_2: int,
+        invert_second: bool,
+        mutual_exclusion_enabled: bool,
+        range_stats: RangeStats,
+        flow_diagnostics: FlowDiagnostics,
+    ) -> None:
+        update_live_tail_on_candles(
+            canvas=self.candle_canvas,
+            bars=bars,
+            trade_plan=trade_plan,
+            live_tail=live_tail,
+            width_adjust_px=width_adjust_px,
+            height_adjust_px=height_adjust_px,
+            pair_gap_adjust_px=pair_gap_adjust_px,
+        )
+
+        line_1, line_2, diff, _, _ = build_signal_line_series(
+            bars=bars,
+            digits_1=digits_1,
+            digits_2=digits_2,
+            invert_second=invert_second,
+            mutual_exclusion_enabled=mutual_exclusion_enabled,
+            range_stats=range_stats,
+        )
+        update_live_tail_on_lines(
+            canvas=self.line_canvas,
+            line_1=line_1,
+            line_2=line_2,
+            diff=diff,
+            flow_diagnostics=flow_diagnostics,
+            live_tail=live_tail,
+            width_adjust_px=width_adjust_px,
+            pair_gap_adjust_px=pair_gap_adjust_px,
+            line_zoom=line_zoom,
         )
 
     def get_index_at_x(self, bars_count: int, x_world: float, width_adjust_px: int, pair_gap_adjust_px: int) -> int | None:

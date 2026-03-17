@@ -99,7 +99,7 @@ def build_panes(window, parent) -> None:
     window.candle_canvas = tk.Canvas(window.candle_body, bg=ACTION_BG, highlightthickness=0)
     window.candle_canvas.pack(fill="both", expand=True)
 
-    window.line_header = window.make_chart_panel_header(window.line_wrap, title="Средние скользящие", indicator_var=window.line_toggle_var, command=window.controller.toggle_line_panel)
+    window.line_header = window.make_chart_panel_header(window.line_wrap, title="Расхождение ходов", indicator_var=window.line_toggle_var, command=window.controller.toggle_line_panel)
     window.line_header.pack(fill="x", side="top")
     window.line_body = tk.Frame(window.line_wrap, bg=ACTION_BG, highlightthickness=0, bd=0)
     window.line_body.pack(fill="both", expand=True)

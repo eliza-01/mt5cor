@@ -27,37 +27,13 @@ def build_relative_bars(
 ) -> pd.DataFrame:
     out = frame.copy()
 
-    out["p1_high"] = transform_price_delta_to_pips(
-        out["high_1"] - out["open_1"],
-        digits_1,
-    )
-    out["p1_low"] = transform_price_delta_to_pips(
-        out["low_1"] - out["open_1"],
-        digits_1,
-    )
-    out["p1_close"] = transform_price_delta_to_pips(
-        out["close_1"] - out["open_1"],
-        digits_1,
-    )
+    out["p1_high"] = transform_price_delta_to_pips(out["high_1"] - out["open_1"], digits_1)
+    out["p1_low"] = transform_price_delta_to_pips(out["low_1"] - out["open_1"], digits_1)
+    out["p1_close"] = transform_price_delta_to_pips(out["close_1"] - out["open_1"], digits_1)
 
-    out["p2_high"] = transform_price_delta_to_pips(
-        out["high_2"] - out["open_2"],
-        digits_2,
-        ratio_1_to_2,
-        invert_second,
-    )
-    out["p2_low"] = transform_price_delta_to_pips(
-        out["low_2"] - out["open_2"],
-        digits_2,
-        ratio_1_to_2,
-        invert_second,
-    )
-    out["p2_close"] = transform_price_delta_to_pips(
-        out["close_2"] - out["open_2"],
-        digits_2,
-        ratio_1_to_2,
-        invert_second,
-    )
+    out["p2_high"] = transform_price_delta_to_pips(out["high_2"] - out["open_2"], digits_2, ratio_1_to_2, invert_second)
+    out["p2_low"] = transform_price_delta_to_pips(out["low_2"] - out["open_2"], digits_2, ratio_1_to_2, invert_second)
+    out["p2_close"] = transform_price_delta_to_pips(out["close_2"] - out["open_2"], digits_2, ratio_1_to_2, invert_second)
 
     out["p1_body_abs"] = out["p1_close"].abs()
     out["p2_body_abs"] = out["p2_close"].abs()
@@ -65,8 +41,12 @@ def build_relative_bars(
     base_columns = [
         "time",
         "open_1",
+        "high_1",
+        "low_1",
         "close_1",
         "open_2",
+        "high_2",
+        "low_2",
         "close_2",
         "p1_high",
         "p1_low",
@@ -79,5 +59,4 @@ def build_relative_bars(
     ]
     if "agg_progress" in out.columns:
         base_columns.append("agg_progress")
-
     return out[base_columns].reset_index(drop=True)

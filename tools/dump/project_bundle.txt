@@ -93,6 +93,11 @@ pandas>=2.2
 python-dotenv>=1.0
 statsmodels>=0.14
 
+# src/__init__.py
+
+# src/__init__.py
+# Package root.
+
 # src/app/ui_relative_compare/__init__.py
 
 
@@ -164,23 +169,16 @@ PANE_MIN_EXPANDED_BOTTOM = 140
 PANE_MIN_COLLAPSED = 32
 
 # src/app/ui_relative_compare/domain/__init__.py
-from .models import (
-    DivergenceStats,
-    HedgeDiagnostics,
-    RelativeMetrics,
-    RenderSnapshot,
-    SignalDiagnostics,
-    TradePlan,
-)
+from .models import DivergenceStats, FlowDiagnostics, HedgeDiagnostics, RangeStats, RenderSnapshot, TradePlan
 from .selection import SelectionState
 
 __all__ = [
     "DivergenceStats",
+    "FlowDiagnostics",
     "HedgeDiagnostics",
-    "RelativeMetrics",
+    "RangeStats",
     "RenderSnapshot",
     "SelectionState",
-    "SignalDiagnostics",
     "TradePlan",
 ]
 
@@ -198,14 +196,6 @@ class DivergenceStats:
     current_bar_diff_pips: float
     live_diff_pips: float
     uses_ratio: bool
-
-
-@dataclass(slots=True)
-class RelativeMetrics:
-    ppm_1: float
-    ppm_2: float
-    ratio_1_to_2: float
-    ratio_2_to_1: float
 
 
 @dataclass(slots=True)
@@ -228,18 +218,27 @@ class HedgeDiagnostics:
 
 
 @dataclass(slots=True)
-class SignalDiagnostics:
-    fast_window: int
-    slow_window: int
-    entry_threshold: float
-    exit_threshold: float
-    gap_last: float
-    fast_last: float
-    slow_last: float
-    ma_diff_last: float
-    signal_side: str
-    entry_ready: bool
-    exit_ready: bool
+class RangeStats:
+    symbol_1_long_total: float
+    symbol_2_long_total: float
+    symbol_1_short_total: float
+    symbol_2_short_total: float
+    long_ratio: float
+    short_ratio: float
+    common_ratio: float
+    apply_long: bool
+    apply_short: bool
+    apply_common: bool
+
+
+@dataclass(slots=True)
+class FlowDiagnostics:
+    line_1_last: float
+    line_2_last: float
+    diff_last: float
+    applied_ratio_long: float
+    applied_ratio_short: float
+    relation_mode: str
 
 
 @dataclass(slots=True)
@@ -261,17 +260,28 @@ class TradePlan:
 
 
 @dataclass(slots=True)
+class LiveTailSnapshot:
+    bar: pd.DataFrame
+    flow_diagnostics: FlowDiagnostics
+    trade_plan: TradePlan
+    aggregate_progress: str | None
+    source_count: int
+
+
+@dataclass(slots=True)
 class RenderSnapshot:
     bars: pd.DataFrame
     divergence_stats: DivergenceStats
     divergence_series: pd.Series
     trade_plan: TradePlan
     hedge_diagnostics: HedgeDiagnostics
-    signal_diagnostics: SignalDiagnostics
+    range_stats: RangeStats
+    flow_diagnostics: FlowDiagnostics
     digits_1: int
     digits_2: int
     ratio_1_to_2: float
     negative_correlation: bool
+    live_tail: LiveTailSnapshot | None = None
 
 # src/app/ui_relative_compare/domain/selection.py
 from __future__ import annotations
@@ -364,28 +374,37 @@ import pandas as pd
 
 def aggregate_pair_frame(frame: pd.DataFrame, bars_per_candle: int) -> pd.DataFrame:
     if bars_per_candle <= 1:
-        return frame.copy().reset_index(drop=True)
+        out = frame.copy().reset_index(drop=True)
+        out["agg_progress"] = "1/1"
+        return out
 
-    grouped = frame.copy()
+    grouped = frame.copy().reset_index(drop=True)
     grouped["_group"] = pd.Series(range(len(grouped)), index=grouped.index) // bars_per_candle
+    grouped["_bar_in_group"] = grouped.groupby("_group", sort=True).cumcount() + 1
+
     aggregated = (
         grouped.groupby("_group", sort=True)
-        .agg({
-            "time": "last",
-            "open_1": "first",
-            "high_1": "max",
-            "low_1": "min",
-            "close_1": "last",
-            "tick_volume_1": "sum",
-            "open_2": "first",
-            "high_2": "max",
-            "low_2": "min",
-            "close_2": "last",
-            "tick_volume_2": "sum",
-        })
+        .agg(
+            {
+                "time": "last",
+                "open_1": "first",
+                "high_1": "max",
+                "low_1": "min",
+                "close_1": "last",
+                "tick_volume_1": "sum",
+                "open_2": "first",
+                "high_2": "max",
+                "low_2": "min",
+                "close_2": "last",
+                "tick_volume_2": "sum",
+                "_bar_in_group": "last",
+            }
+        )
         .reset_index(drop=True)
     )
-    return aggregated
+
+    aggregated["agg_progress"] = aggregated["_bar_in_group"].astype(int).astype(str) + f"/{int(bars_per_candle)}"
+    return aggregated.drop(columns=["_bar_in_group"])
 
 # src/app/ui_relative_compare/services/market/common.py
 MIN_ORDER_LOTS = 0.01
@@ -759,17 +778,67 @@ def calculate_relative_metrics(frame: pd.DataFrame, digits_1: int, digits_2: int
 
     return RelativeMetrics(ppm_1=ppm_1, ppm_2=ppm_2, ratio_1_to_2=ppm_1 / ppm_2, ratio_2_to_1=ppm_2 / ppm_1)
 
+# src/app/ui_relative_compare/services/market/range_stats.py
+from __future__ import annotations
+
+import math
+
+import pandas as pd
+
+from src.app.ui_relative_compare.domain import RangeStats
+from .transform import transform_price_delta_to_pips
+
+
+EPS = 1e-12
+
+
+def _safe_ratio(left: float, right: float) -> float:
+    if not math.isfinite(right) or abs(right) <= EPS:
+        return 1.0
+    value = float(left) / float(right)
+    return float(value) if math.isfinite(value) and value > EPS else 1.0
+
+
+def build_range_stats(
+    frame: pd.DataFrame,
+    digits_1: int,
+    digits_2: int,
+    apply_long: bool,
+    apply_short: bool,
+    apply_common: bool,
+) -> RangeStats:
+    long_1 = transform_price_delta_to_pips(frame["high_1"].astype(float) - frame["open_1"].astype(float), digits_1)
+    short_1 = transform_price_delta_to_pips(frame["open_1"].astype(float) - frame["low_1"].astype(float), digits_1)
+    long_2 = transform_price_delta_to_pips(frame["high_2"].astype(float) - frame["open_2"].astype(float), digits_2)
+    short_2 = transform_price_delta_to_pips(frame["open_2"].astype(float) - frame["low_2"].astype(float), digits_2)
+
+    long_total_1 = float(long_1.sum())
+    long_total_2 = float(long_2.sum())
+    short_total_1 = float(short_1.sum())
+    short_total_2 = float(short_2.sum())
+
+    return RangeStats(
+        symbol_1_long_total=long_total_1,
+        symbol_2_long_total=long_total_2,
+        symbol_1_short_total=short_total_1,
+        symbol_2_short_total=short_total_2,
+        long_ratio=_safe_ratio(long_total_1, long_total_2),
+        short_ratio=_safe_ratio(short_total_1, short_total_2),
+        common_ratio=_safe_ratio(long_total_1 + short_total_1, long_total_2 + short_total_2),
+        apply_long=bool(apply_long),
+        apply_short=bool(apply_short),
+        apply_common=bool(apply_common),
+    )
+
 # src/app/ui_relative_compare/services/market/signal/__init__.py
-from .analysis import analyze_ma_gap_signal, build_signal_plot_series
-from .direction import build_spread_trade_directions
+from .analysis import analyze_flow_signal, build_signal_plot_series
 from .models import SignalComputationResult, SignalPlotSeries
 
 __all__ = [
     "SignalComputationResult",
     "SignalPlotSeries",
-    "analyze_ma_gap_signal",
+    "analyze_flow_signal",
     "build_signal_plot_series",
-    "build_spread_trade_directions",
 ]
 
 # src/app/ui_relative_compare/services/market/signal/analysis.py
@@ -777,8 +846,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .direction import build_spread_trade_directions
-from .ma import sma
+from src.app.ui_relative_compare.domain import RangeStats
 from .models import SignalComputationResult, SignalPlotSeries
 from .relative_lines import build_relative_line_series
 
@@ -787,82 +855,49 @@ def build_signal_plot_series(
     bars: pd.DataFrame,
     digits_1: int,
     digits_2: int,
-    ratio_1_to_2: float,
     invert_second: bool,
     mutual_exclusion_enabled: bool,
-    fast_window: int,
-    slow_window: int,
+    range_stats: RangeStats,
 ) -> SignalPlotSeries:
-    line_1, line_2 = build_relative_line_series(
+    line_1, line_2, diff, applied_ratio_long, applied_ratio_short = build_relative_line_series(
         bars=bars,
         digits_1=digits_1,
         digits_2=digits_2,
-        ratio_1_to_2=ratio_1_to_2,
         invert_second=invert_second,
         mutual_exclusion_enabled=mutual_exclusion_enabled,
+        range_stats=range_stats,
     )
-    gap = (line_1 - line_2).astype(float)
-    fast_ma = sma(gap, fast_window)
-    slow_ma = sma(gap, slow_window)
-    ma_diff = (fast_ma - slow_ma).astype(float)
-    return SignalPlotSeries(gap=gap, fast_ma=fast_ma, slow_ma=slow_ma, ma_diff=ma_diff)
+    return SignalPlotSeries(
+        line_1=line_1,
+        line_2=line_2,
+        diff=diff,
+        applied_ratio_long=applied_ratio_long,
+        applied_ratio_short=applied_ratio_short,
+    )
 
 
-def analyze_ma_gap_signal(
+def analyze_flow_signal(
     bars: pd.DataFrame,
     digits_1: int,
     digits_2: int,
-    ratio_1_to_2: float,
     invert_second: bool,
     mutual_exclusion_enabled: bool,
-    fast_window: int,
-    slow_window: int,
-    entry_threshold: float,
-    exit_threshold: float,
+    range_stats: RangeStats,
 ) -> SignalComputationResult:
     plot = build_signal_plot_series(
         bars=bars,
         digits_1=digits_1,
         digits_2=digits_2,
-        ratio_1_to_2=ratio_1_to_2,
         invert_second=invert_second,
         mutual_exclusion_enabled=mutual_exclusion_enabled,
-        fast_window=fast_window,
-        slow_window=slow_window,
+        range_stats=range_stats,
     )
-
-    gap_last = float(plot.gap.iloc[-1]) if not plot.gap.empty else 0.0
-    fast_last = float(plot.fast_ma.iloc[-1]) if not plot.fast_ma.empty else 0.0
-    slow_last = float(plot.slow_ma.iloc[-1]) if not plot.slow_ma.empty else 0.0
-    ma_diff_last = float(plot.ma_diff.iloc[-1]) if not plot.ma_diff.empty else 0.0
-
-    threshold_entry = abs(float(entry_threshold))
-    threshold_exit = abs(float(exit_threshold))
-
-    if ma_diff_last >= threshold_entry:
-        signal_side = "short"
-        entry_ready = True
-    elif ma_diff_last <= -threshold_entry:
-        signal_side = "long"
-        entry_ready = True
-    else:
-        signal_side = "flat"
-        entry_ready = False
-
-    exit_ready = abs(ma_diff_last) <= threshold_exit
-
     return SignalComputationResult(
-        fast_window=max(1, int(fast_window)),
-        slow_window=max(1, int(slow_window)),
-        entry_threshold=threshold_entry,
-        exit_threshold=threshold_exit,
-        gap_last=gap_last,
-        fast_last=fast_last,
-        slow_last=slow_last,
-        ma_diff_last=ma_diff_last,
-        signal_side=signal_side,
-        entry_ready=entry_ready,
-        exit_ready=exit_ready,
+        line_1_last=float(plot.line_1.iloc[-1]) if not plot.line_1.empty else 0.0,
+        line_2_last=float(plot.line_2.iloc[-1]) if not plot.line_2.empty else 0.0,
+        diff_last=float(plot.diff.iloc[-1]) if not plot.diff.empty else 0.0,
+        applied_ratio_long=float(plot.applied_ratio_long),
+        applied_ratio_short=float(plot.applied_ratio_short),
     )
 
 # src/app/ui_relative_compare/services/market/signal/direction.py
@@ -906,141 +941,290 @@ import pandas as pd
 
 @dataclass(slots=True)
 class SignalPlotSeries:
-    gap: pd.Series
-    fast_ma: pd.Series
-    slow_ma: pd.Series
-    ma_diff: pd.Series
+    line_1: pd.Series
+    line_2: pd.Series
+    diff: pd.Series
+    applied_ratio_long: float
+    applied_ratio_short: float
 
 
 @dataclass(slots=True)
 class SignalComputationResult:
-    fast_window: int
-    slow_window: int
-    entry_threshold: float
-    exit_threshold: float
-    gap_last: float
-    fast_last: float
-    slow_last: float
-    ma_diff_last: float
-    signal_side: str
-    entry_ready: bool
-    exit_ready: bool
+    line_1_last: float
+    line_2_last: float
+    diff_last: float
+    applied_ratio_long: float
+    applied_ratio_short: float
 
 # src/app/ui_relative_compare/services/market/signal/relative_lines.py
 from __future__ import annotations
 
 import pandas as pd
 
+from src.app.ui_relative_compare.domain import RangeStats
 from src.app.ui_relative_compare.services.market.transform import transform_price_delta_to_pips
+
+
+def _applied_ratios(range_stats: RangeStats) -> tuple[float, float]:
+    if range_stats.apply_common:
+        return float(range_stats.common_ratio), float(range_stats.common_ratio)
+    long_ratio = float(range_stats.long_ratio) if range_stats.apply_long else 1.0
+    short_ratio = float(range_stats.short_ratio) if range_stats.apply_short else 1.0
+    return long_ratio, short_ratio
 
 
 def build_relative_line_series(
     bars: pd.DataFrame,
     digits_1: int,
     digits_2: int,
-    ratio_1_to_2: float,
     invert_second: bool,
     mutual_exclusion_enabled: bool,
-) -> tuple[pd.Series, pd.Series]:
+    range_stats: RangeStats,
+) -> tuple[pd.Series, pd.Series, pd.Series, float, float]:
     if bars.empty:
-        return pd.Series(dtype=float), pd.Series(dtype=float)
+        empty = pd.Series(dtype=float)
+        return empty, empty, empty, 1.0, 1.0
 
-    close_to_close_1 = transform_price_delta_to_pips(
-        bars["close_1"].astype(float).diff().fillna(0.0),
-        digits_1,
-    )
-    close_to_close_2 = transform_price_delta_to_pips(
-        bars["close_2"].astype(float).diff().fillna(0.0),
-        digits_2,
-        ratio_1_to_2,
-        invert_second,
-    )
+    long_ratio, short_ratio = _applied_ratios(range_stats)
 
-    out_1 = [0.0]
-    out_2 = [0.0]
+    long_1 = transform_price_delta_to_pips(bars["high_1"].astype(float) - bars["open_1"].astype(float), digits_1)
+    short_1 = transform_price_delta_to_pips(bars["open_1"].astype(float) - bars["low_1"].astype(float), digits_1)
+
+    long_2_raw = transform_price_delta_to_pips(bars["high_2"].astype(float) - bars["open_2"].astype(float), digits_2)
+    short_2_raw = transform_price_delta_to_pips(bars["open_2"].astype(float) - bars["low_2"].astype(float), digits_2)
+
+    long_2_scaled = long_2_raw.astype(float) * float(long_ratio)
+    short_2_scaled = short_2_raw.astype(float) * float(short_ratio)
+
+    if invert_second:
+        long_2 = short_2_scaled
+        short_2 = long_2_scaled
+    else:
+        long_2 = long_2_scaled
+        short_2 = short_2_scaled
+
+    out_1 = []
+    out_2 = []
+    diff = []
     acc_1 = 0.0
     acc_2 = 0.0
 
-    for i in range(1, len(bars)):
-        move_1 = float(close_to_close_1.iloc[i])
-        move_2 = float(close_to_close_2.iloc[i])
+    for i in range(len(bars)):
+        move_long_1 = float(long_1.iloc[i])
+        move_short_1 = float(short_1.iloc[i])
+        move_long_2 = float(long_2.iloc[i])
+        move_short_2 = float(short_2.iloc[i])
 
-        if mutual_exclusion_enabled and move_1 * move_2 > 0:
-            common = min(abs(move_1), abs(move_2))
-            direction = 1.0 if move_1 > 0 else -1.0
-            move_1 -= direction * common
-            move_2 -= direction * common
+        if mutual_exclusion_enabled:
+            common_long = min(move_long_1, move_long_2)
+            common_short = min(move_short_1, move_short_2)
+            move_long_1 -= common_long
+            move_long_2 -= common_long
+            move_short_1 -= common_short
+            move_short_2 -= common_short
 
-        acc_1 += move_1
-        acc_2 += move_2
+        acc_1 += move_long_1 - move_short_1
+        acc_2 += move_long_2 - move_short_2
         out_1.append(acc_1)
         out_2.append(acc_2)
+        diff.append(acc_1 - acc_2)
 
-    return pd.Series(out_1, dtype=float), pd.Series(out_2, dtype=float)
+    return (
+        pd.Series(out_1, dtype=float),
+        pd.Series(out_2, dtype=float),
+        pd.Series(diff, dtype=float),
+        float(long_ratio),
+        float(short_ratio),
+    )
 
 # src/app/ui_relative_compare/services/market/snapshot.py
 from __future__ import annotations
 
-from src.app.ui_relative_compare.domain import HedgeDiagnostics, RenderSnapshot, SignalDiagnostics
+import pandas as pd
+
+from src.app.ui_relative_compare.domain.models import (
+    DivergenceStats,
+    FlowDiagnostics,
+    HedgeDiagnostics,
+    LiveTailSnapshot,
+    RenderSnapshot,
+)
 from src.app.ui_relative_compare.services.market.hedge import analyze_pair_hedge
-from src.app.ui_relative_compare.services.market.signal import analyze_ma_gap_signal
+from src.app.ui_relative_compare.services.market.signal import analyze_flow_signal
 from src.broker.mt5_client import MT5Client
-from src.common.settings import Settings
 from .aggregation import aggregate_pair_frame
 from .divergence import build_divergence_series
 from .loaders import load_two_symbols
+from .range_stats import build_range_stats
 from .trade_plan import build_trade_plan
 from .transform import build_relative_bars
 
 
+def _empty_frame_like(frame: pd.DataFrame) -> pd.DataFrame:
+    return frame.iloc[0:0].copy().reset_index(drop=True)
+
+
+def _apply_live_ticks(raw_frame: pd.DataFrame, tick_1, tick_2) -> pd.DataFrame:
+    if raw_frame.empty:
+        return raw_frame
+
+    out = raw_frame.copy()
+    last = len(out) - 1
+
+    bid_1 = float(tick_1["bid"])
+    bid_2 = float(tick_2["bid"])
+
+    out.at[last, "close_1"] = bid_1
+    out.at[last, "high_1"] = max(float(out.at[last, "high_1"]), bid_1)
+    out.at[last, "low_1"] = min(float(out.at[last, "low_1"]), bid_1)
+
+    out.at[last, "close_2"] = bid_2
+    out.at[last, "high_2"] = max(float(out.at[last, "high_2"]), bid_2)
+    out.at[last, "low_2"] = min(float(out.at[last, "low_2"]), bid_2)
+    return out
+
+
+def _split_closed_and_live_frames(raw_frame: pd.DataFrame, bars_per_candle: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if raw_frame.empty:
+        empty = _empty_frame_like(raw_frame)
+        return empty, empty
+
+    closed_source = raw_frame.iloc[:-1].copy().reset_index(drop=True)
+    if closed_source.empty:
+        return _empty_frame_like(raw_frame), raw_frame.copy().reset_index(drop=True)
+
+    closed_aggregated = aggregate_pair_frame(closed_source, bars_per_candle).reset_index(drop=True)
+    full_progress = f"{int(bars_per_candle)}/{int(bars_per_candle)}"
+
+    if bars_per_candle > 1 and not closed_aggregated.empty:
+        if str(closed_aggregated.iloc[-1]["agg_progress"]) != full_progress:
+            closed_aggregated = closed_aggregated.iloc[:-1].reset_index(drop=True)
+
+    consumed_raw = int(len(closed_aggregated) * max(1, int(bars_per_candle)))
+    live_source = raw_frame.iloc[consumed_raw:].copy().reset_index(drop=True)
+    return closed_aggregated, live_source
+
+
+def _build_zero_divergence(ratio_1_to_2: float) -> tuple[pd.Series, DivergenceStats]:
+    return (
+        pd.Series(dtype=float),
+        DivergenceStats(
+            total_diff_pips=0.0,
+            current_bar_diff_pips=0.0,
+            live_diff_pips=0.0,
+            uses_ratio=abs(float(ratio_1_to_2) - 1.0) > 1e-12,
+        ),
+    )
+
+
+def _build_flow(
+    bars: pd.DataFrame,
+    digits_1: int,
+    digits_2: int,
+    invert_second: bool,
+    mutual_exclusion_enabled: bool,
+    range_stats,
+    relation_mode: str,
+) -> FlowDiagnostics:
+    if bars.empty:
+        return FlowDiagnostics(
+            line_1_last=0.0,
+            line_2_last=0.0,
+            diff_last=0.0,
+            applied_ratio_long=float(range_stats.common_ratio if range_stats.apply_common else (range_stats.long_ratio if range_stats.apply_long else 1.0)),
+            applied_ratio_short=float(range_stats.common_ratio if range_stats.apply_common else (range_stats.short_ratio if range_stats.apply_short else 1.0)),
+            relation_mode=relation_mode,
+        )
+
+    flow_result = analyze_flow_signal(
+        bars=bars,
+        digits_1=digits_1,
+        digits_2=digits_2,
+        invert_second=invert_second,
+        mutual_exclusion_enabled=mutual_exclusion_enabled,
+        range_stats=range_stats,
+    )
+    return FlowDiagnostics(
+        line_1_last=flow_result.line_1_last,
+        line_2_last=flow_result.line_2_last,
+        diff_last=flow_result.diff_last,
+        applied_ratio_long=flow_result.applied_ratio_long,
+        applied_ratio_short=flow_result.applied_ratio_short,
+        relation_mode=relation_mode,
+    )
+
+
 def build_render_snapshot(
     client: MT5Client,
-    cfg: Settings,
     symbol_1: str,
     symbol_2: str,
     timeframe: str,
     bars_count: int,
-    ratio_1_to_2: float,
     bars_per_candle: int,
     mutual_exclusion_enabled: bool,
-    signal_fast_window: int,
-    signal_slow_window: int,
-    signal_entry_threshold: float,
-    signal_exit_threshold: float,
-    invert_second: bool = False,
+    base_lot: float,
+    lot_multiplier_1: float,
+    lot_multiplier_2: float,
+    apply_long_ratio: bool,
+    apply_short_ratio: bool,
+    apply_common_ratio: bool,
+    use_live_ticks: bool = True,
 ) -> RenderSnapshot:
     raw_frame, meta_1, meta_2 = load_two_symbols(client, symbol_1, symbol_2, timeframe, bars_count)
+
+    tick_1 = client.tick(symbol_1)
+    tick_2 = client.tick(symbol_2)
+
+    if use_live_ticks:
+        raw_frame = _apply_live_ticks(raw_frame, tick_1, tick_2)
+
+    hedge_source = raw_frame.iloc[:-1].copy().reset_index(drop=True)
+    if len(hedge_source) < 10:
+        hedge_source = raw_frame.copy().reset_index(drop=True)
+
     hedge_result = analyze_pair_hedge(
-        close_1=raw_frame["close_1"],
-        close_2=raw_frame["close_2"],
+        close_1=hedge_source["close_1"],
+        close_2=hedge_source["close_2"],
         symbol_1=symbol_1,
         symbol_2=symbol_2,
         meta_1=meta_1,
         meta_2=meta_2,
     )
-    effective_ratio = hedge_result.execution_ratio_abs if hedge_result.execution_ratio_abs > 1e-12 else ratio_1_to_2
     effective_invert_second = hedge_result.side_relation == "same"
 
-    render_frame = aggregate_pair_frame(raw_frame, bars_per_candle)
+    closed_frame, live_source = _split_closed_and_live_frames(raw_frame, bars_per_candle)
+
+    range_stats = build_range_stats(
+        frame=closed_frame,
+        digits_1=meta_1.digits,
+        digits_2=meta_2.digits,
+        apply_long=apply_long_ratio,
+        apply_short=apply_short_ratio,
+        apply_common=apply_common_ratio,
+    )
+
+    effective_ratio = float(range_stats.common_ratio) if range_stats.apply_common else 1.0
+
     bars = build_relative_bars(
-        render_frame,
+        closed_frame,
         meta_1.digits,
         meta_2.digits,
         effective_ratio,
         effective_invert_second,
     )
 
-    tick_1 = client.tick(symbol_1)
-    tick_2 = client.tick(symbol_2)
-    divergence_series, divergence_stats = build_divergence_series(
-        frame=render_frame,
-        digits_1=meta_1.digits,
-        digits_2=meta_2.digits,
-        ratio_1_to_2=effective_ratio,
-        invert_second=effective_invert_second,
-        bid_1=float(tick_1["bid"]),
-        bid_2=float(tick_2["bid"]),
-    )
+    if closed_frame.empty:
+        divergence_series, divergence_stats = _build_zero_divergence(effective_ratio)
+    else:
+        divergence_series, divergence_stats = build_divergence_series(
+            frame=closed_frame,
+            digits_1=meta_1.digits,
+            digits_2=meta_2.digits,
+            ratio_1_to_2=effective_ratio,
+            invert_second=effective_invert_second,
+            bid_1=None,
+            bid_2=None,
+        )
 
     hedge = HedgeDiagnostics(
         window=hedge_result.window,
@@ -1060,44 +1244,97 @@ def build_render_snapshot(
         conversion_mode_2=hedge_result.conversion_mode_2,
     )
 
-    signal_result = analyze_ma_gap_signal(
-        bars=bars,
+    base_plan_bars = bars
+    if base_plan_bars.empty and not live_source.empty:
+        live_preview_frame = aggregate_pair_frame(live_source, bars_per_candle).tail(1).reset_index(drop=True)
+        base_plan_bars = build_relative_bars(
+            live_preview_frame,
+            meta_1.digits,
+            meta_2.digits,
+            effective_ratio,
+            effective_invert_second,
+        )
+
+    flow = _build_flow(
+        bars=bars if not bars.empty else base_plan_bars,
         digits_1=meta_1.digits,
         digits_2=meta_2.digits,
-        ratio_1_to_2=effective_ratio,
         invert_second=effective_invert_second,
         mutual_exclusion_enabled=mutual_exclusion_enabled,
-        fast_window=signal_fast_window,
-        slow_window=signal_slow_window,
-        entry_threshold=signal_entry_threshold,
-        exit_threshold=signal_exit_threshold,
-    )
-    signal = SignalDiagnostics(
-        fast_window=signal_result.fast_window,
-        slow_window=signal_result.slow_window,
-        entry_threshold=signal_result.entry_threshold,
-        exit_threshold=signal_result.exit_threshold,
-        gap_last=signal_result.gap_last,
-        fast_last=signal_result.fast_last,
-        slow_last=signal_result.slow_last,
-        ma_diff_last=signal_result.ma_diff_last,
-        signal_side=signal_result.signal_side,
-        entry_ready=signal_result.entry_ready,
-        exit_ready=signal_result.exit_ready,
+        range_stats=range_stats,
+        relation_mode=hedge.side_relation,
     )
 
-    trade_plan = build_trade_plan(bars, symbol_1, symbol_2, meta_1, meta_2, cfg, hedge, signal)
+    trade_plan = build_trade_plan(
+        bars=base_plan_bars,
+        symbol_1=symbol_1,
+        symbol_2=symbol_2,
+        meta_1=meta_1,
+        meta_2=meta_2,
+        hedge=hedge,
+        flow=flow,
+        range_stats=range_stats,
+        base_lot=base_lot,
+        lot_multiplier_1=lot_multiplier_1,
+        lot_multiplier_2=lot_multiplier_2,
+    )
+
+    live_tail: LiveTailSnapshot | None = None
+    if not live_source.empty:
+        live_preview_frame = aggregate_pair_frame(live_source, bars_per_candle).tail(1).reset_index(drop=True)
+        live_bar = build_relative_bars(
+            live_preview_frame,
+            meta_1.digits,
+            meta_2.digits,
+            effective_ratio,
+            effective_invert_second,
+        )
+
+        combined_bars = pd.concat([bars, live_bar], ignore_index=True)
+        live_flow = _build_flow(
+            bars=combined_bars,
+            digits_1=meta_1.digits,
+            digits_2=meta_2.digits,
+            invert_second=effective_invert_second,
+            mutual_exclusion_enabled=mutual_exclusion_enabled,
+            range_stats=range_stats,
+            relation_mode=hedge.side_relation,
+        )
+        live_trade_plan = build_trade_plan(
+            bars=combined_bars,
+            symbol_1=symbol_1,
+            symbol_2=symbol_2,
+            meta_1=meta_1,
+            meta_2=meta_2,
+            hedge=hedge,
+            flow=live_flow,
+            range_stats=range_stats,
+            base_lot=base_lot,
+            lot_multiplier_1=lot_multiplier_1,
+            lot_multiplier_2=lot_multiplier_2,
+        )
+
+        live_tail = LiveTailSnapshot(
+            bar=live_bar,
+            flow_diagnostics=live_flow,
+            trade_plan=live_trade_plan,
+            aggregate_progress=str(live_preview_frame.iloc[-1]["agg_progress"]) if "agg_progress" in live_preview_frame.columns else None,
+            source_count=int(len(live_source)),
+        )
+
     return RenderSnapshot(
         bars=bars,
         divergence_stats=divergence_stats,
         divergence_series=divergence_series,
         trade_plan=trade_plan,
         hedge_diagnostics=hedge,
-        signal_diagnostics=signal,
+        range_stats=range_stats,
+        flow_diagnostics=flow,
         digits_1=meta_1.digits,
         digits_2=meta_2.digits,
         ratio_1_to_2=effective_ratio,
         negative_correlation=effective_invert_second,
+        live_tail=live_tail,
     )
 
 # src/app/ui_relative_compare/services/market/trade_plan.py
@@ -1107,10 +1344,8 @@ import math
 
 import pandas as pd
 
-from src.app.ui_relative_compare.domain import HedgeDiagnostics, SignalDiagnostics, TradePlan
-from src.app.ui_relative_compare.services.market.signal import build_spread_trade_directions
+from src.app.ui_relative_compare.domain import FlowDiagnostics, HedgeDiagnostics, RangeStats, TradePlan
 from src.broker.mt5_client import SymbolMeta
-from src.common.settings import Settings
 from .common import MIN_ORDER_LOTS
 
 
@@ -1123,28 +1358,55 @@ def normalize_lot(volume: float, meta: SymbolMeta) -> float:
     return round(max(normalized, minimum), digits)
 
 
+def ratio_for_side(side: str, range_stats: RangeStats) -> float:
+    if range_stats.apply_common:
+        return float(range_stats.common_ratio)
+    if side == "buy" and range_stats.apply_long:
+        return float(range_stats.long_ratio)
+    if side == "sell" and range_stats.apply_short:
+        return float(range_stats.short_ratio)
+    return 1.0
+
+
 def build_trade_plan(
     bars: pd.DataFrame,
     symbol_1: str,
     symbol_2: str,
     meta_1: SymbolMeta,
     meta_2: SymbolMeta,
-    cfg: Settings,
     hedge: HedgeDiagnostics,
-    signal: SignalDiagnostics,
+    flow: FlowDiagnostics,
+    range_stats: RangeStats,
+    base_lot: float,
+    lot_multiplier_1: float,
+    lot_multiplier_2: float,
 ) -> TradePlan:
     row = bars.iloc[-1]
     move_1 = abs(float(row["p1_close"]))
     move_2 = abs(float(row["p2_close"]))
 
-    lot_1 = normalize_lot(cfg.base_lot_eurusd, meta_1)
-    ratio_abs = hedge.execution_ratio_abs if hedge.execution_ratio_abs > 1e-12 else 1.0
-    lot_2 = normalize_lot(cfg.base_lot_eurusd * ratio_abs, meta_2)
+    signal_value = float(flow.diff_last)
+    if signal_value > 0:
+        spread_side, symbol_1_side = "short", "sell"
+    elif signal_value < 0:
+        spread_side, symbol_1_side = "long", "buy"
+    else:
+        spread_side, symbol_1_side = "flat", "flat"
 
-    spread_side, symbol_1_side, symbol_2_side = build_spread_trade_directions(
-        signal_side=signal.signal_side,
-        side_relation=hedge.side_relation,
-    )
+    if hedge.side_relation == "same":
+        symbol_2_side = symbol_1_side
+    elif symbol_1_side == "sell":
+        symbol_2_side = "buy"
+    elif symbol_1_side == "buy":
+        symbol_2_side = "sell"
+    else:
+        symbol_2_side = "flat"
+
+    ratio_1 = 1.0
+    ratio_2 = ratio_for_side(symbol_1_side, range_stats) if symbol_1_side != "flat" else (float(range_stats.common_ratio) if range_stats.apply_common else 1.0)
+
+    lot_1 = normalize_lot(float(base_lot) * float(lot_multiplier_1) * ratio_1, meta_1)
+    lot_2 = normalize_lot(float(base_lot) * float(lot_multiplier_2) * ratio_2, meta_2)
 
     if move_1 >= move_2:
         leader_symbol, follower_symbol = symbol_1, symbol_2
@@ -1162,8 +1424,8 @@ def build_trade_plan(
         symbol_2_side=symbol_2_side,
         spread_side=spread_side,
         side_relation=hedge.side_relation,
-        signal_value=signal.ma_diff_last,
-        entry_ready=signal.entry_ready,
+        signal_value=signal_value,
+        entry_ready=False,
         leader_symbol=leader_symbol,
         follower_symbol=follower_symbol,
         leader_move=leader_move,
@@ -1200,58 +1462,39 @@ def build_relative_bars(
 ) -> pd.DataFrame:
     out = frame.copy()
 
-    out["p1_high"] = transform_price_delta_to_pips(
-        out["high_1"] - out["open_1"],
-        digits_1,
-    )
-    out["p1_low"] = transform_price_delta_to_pips(
-        out["low_1"] - out["open_1"],
-        digits_1,
-    )
-    out["p1_close"] = transform_price_delta_to_pips(
-        out["close_1"] - out["open_1"],
-        digits_1,
-    )
+    out["p1_high"] = transform_price_delta_to_pips(out["high_1"] - out["open_1"], digits_1)
+    out["p1_low"] = transform_price_delta_to_pips(out["low_1"] - out["open_1"], digits_1)
+    out["p1_close"] = transform_price_delta_to_pips(out["close_1"] - out["open_1"], digits_1)
 
-    out["p2_high"] = transform_price_delta_to_pips(
-        out["high_2"] - out["open_2"],
-        digits_2,
-        ratio_1_to_2,
-        invert_second,
-    )
-    out["p2_low"] = transform_price_delta_to_pips(
-        out["low_2"] - out["open_2"],
-        digits_2,
-        ratio_1_to_2,
-        invert_second,
-    )
-    out["p2_close"] = transform_price_delta_to_pips(
-        out["close_2"] - out["open_2"],
-        digits_2,
-        ratio_1_to_2,
-        invert_second,
-    )
+    out["p2_high"] = transform_price_delta_to_pips(out["high_2"] - out["open_2"], digits_2, ratio_1_to_2, invert_second)
+    out["p2_low"] = transform_price_delta_to_pips(out["low_2"] - out["open_2"], digits_2, ratio_1_to_2, invert_second)
+    out["p2_close"] = transform_price_delta_to_pips(out["close_2"] - out["open_2"], digits_2, ratio_1_to_2, invert_second)
 
     out["p1_body_abs"] = out["p1_close"].abs()
     out["p2_body_abs"] = out["p2_close"].abs()
 
-    return out[
-        [
-            "time",
-            "open_1",
-            "close_1",
-            "open_2",
-            "close_2",
-            "p1_high",
-            "p1_low",
-            "p1_close",
-            "p2_high",
-            "p2_low",
-            "p2_close",
-            "p1_body_abs",
-            "p2_body_abs",
-        ]
-    ].reset_index(drop=True)
+    base_columns = [
+        "time",
+        "open_1",
+        "high_1",
+        "low_1",
+        "close_1",
+        "open_2",
+        "high_2",
+        "low_2",
+        "close_2",
+        "p1_high",
+        "p1_low",
+        "p1_close",
+        "p2_high",
+        "p2_low",
+        "p2_close",
+        "p1_body_abs",
+        "p2_body_abs",
+    ]
+    if "agg_progress" in out.columns:
+        base_columns.append("agg_progress")
+    return out[base_columns].reset_index(drop=True)
 
 # src/app/ui_relative_compare/services/trading/__init__.py
 from .models import ClosePairSummary, OrderLegSummary, OrderSendSummary, ReopenedLeg, ReversePairSummary
@@ -1731,26 +1974,25 @@ from dataclasses import dataclass
 @dataclass(slots=True)
 class UIState:
     symbol_1: str = "EURUSD"
-    symbol_2: str = "AUDUSD"
+    symbol_2: str = "USDCHF"
     timeframe: str = "M1"
-    visible_bars: str = "120"
+    visible_bars: str = "1200"
     refresh_ms: str = "250"
     aggregate_bars: str = "1"
-    manual_ratio_1_to_2: str = "1.000000"
-    negative_correlation: bool = False
+    base_trading_lot: str = "0.10"
+    cost_coeff_1: str = "1.00"
+    cost_coeff_2: str = "1.00"
+    cost_coeff_1_enabled: bool = True
+    cost_coeff_2_enabled: bool = True
     mutual_exclusion_enabled: bool = True
-    auto_volume: bool = True
-    manual_lot_1: str = "0.10"
-    manual_lot_2: str = "0.10"
-    signal_fast_ma: str = "8"
-    signal_slow_ma: str = "34"
-    signal_entry_threshold: str = "12.0"
-    signal_exit_threshold: str = "3.0"
-    line_chart_mode: str = "gap_ma"
+    apply_long_ratio: bool = False
+    apply_short_ratio: bool = False
+    apply_common_ratio: bool = True
     width_adjust_px: int = 0
     height_adjust_px: int = 0
     pair_gap_adjust_px: int = 0
     chart_split_y: int = 560
+    sizing_collapsed: bool = True
     candle_collapsed: bool = False
     line_collapsed: bool = False
     pair_1_up_color: str = "#34d399"
@@ -1894,10 +2136,116 @@ import pandas as pd
 import tkinter as tk
 
 from src.app.ui_relative_compare.constants import CHART_AXIS, CHART_BG, CHART_GRID, CHART_TEXT
-from src.app.ui_relative_compare.domain import TradePlan
+from src.app.ui_relative_compare.domain.models import LiveTailSnapshot, TradePlan
 from .layout import LEFT_PAD, RIGHT_PAD, pair_layout, pair_positions, pair_total_width
-from .primitives import draw_body, draw_buy_arrow, draw_sell_arrow
+from .primitives import draw_body
 from .selection import draw_selection_on_candles
+
+
+LIVE_TAIL_TAG = "live_tail"
+
+
+def _max_abs_for_scale(bars: pd.DataFrame, live_tail: LiveTailSnapshot | None) -> float:
+    frames: list[pd.DataFrame] = []
+    if not bars.empty:
+        frames.append(bars)
+    elif live_tail is not None and not live_tail.bar.empty:
+        frames.append(live_tail.bar)
+
+    max_abs = 1.0
+    for frame in frames:
+        for col in ["p1_high", "p1_low", "p1_close", "p2_high", "p2_low", "p2_close"]:
+            val = frame[col].abs().max()
+            if pd.notna(val):
+                max_abs = max(max_abs, float(val))
+    return max_abs
+
+
+def _draw_bar(canvas: tk.Canvas, row, index: int, center_y: float, scale: float, layout, colors: dict[str, str], tags=()) -> None:
+    p1_x, p2_x, _ = pair_positions(index, LEFT_PAD, layout.body_half, layout.pair_gap, layout.pair_width)
+
+    p1_high_y = center_y - float(row["p1_high"]) * scale
+    p1_low_y = center_y - float(row["p1_low"]) * scale
+    p1_close_y = center_y - float(row["p1_close"]) * scale
+
+    p2_high_y = center_y - float(row["p2_high"]) * scale
+    p2_low_y = center_y - float(row["p2_low"]) * scale
+    p2_close_y = center_y - float(row["p2_close"]) * scale
+
+    p1_color = colors["pair_1_up"] if float(row["p1_close"]) >= 0 else colors["pair_1_down"]
+    p2_color = colors["pair_2_up"] if float(row["p2_close"]) >= 0 else colors["pair_2_down"]
+
+    canvas.create_line(p1_x, p1_high_y, p1_x, p1_low_y, fill=p1_color, width=1, tags=tags)
+    canvas.create_line(p2_x, p2_high_y, p2_x, p2_low_y, fill=p2_color, width=1, tags=tags)
+    draw_body(canvas, p1_x, center_y, p1_close_y, layout.body_half, p1_color)
+    draw_body(canvas, p2_x, center_y, p2_close_y, layout.body_half, p2_color)
+
+
+def update_live_tail_on_candles(
+    canvas: tk.Canvas,
+    bars: pd.DataFrame,
+    trade_plan: TradePlan,
+    live_tail: LiveTailSnapshot | None,
+    width_adjust_px: int,
+    height_adjust_px: int,
+    pair_gap_adjust_px: int,
+) -> None:
+    canvas.update_idletasks()
+    viewport_width = max(canvas.winfo_width(), 400)
+    height = max(canvas.winfo_height(), 240)
+    viewport_left = float(canvas.canvasx(0))
+    viewport_right = viewport_left + float(viewport_width)
+
+    layout = pair_layout(width_adjust_px, pair_gap_adjust_px)
+    total_count = len(bars) + (1 if live_tail is not None and not live_tail.bar.empty else 0)
+    total_width = max(viewport_width, LEFT_PAD + pair_total_width(total_count, layout.pair_width, layout.pair_gap) + RIGHT_PAD)
+
+    center_y = height / 2
+    top_pad = 40
+    bottom_pad = 34
+    usable_half = max(40.0, (height - top_pad - bottom_pad) / 2 - 10)
+
+    max_abs = _max_abs_for_scale(bars, live_tail)
+    base_scale = usable_half / (max_abs * 1.15)
+    scale = max(0.5, base_scale + height_adjust_px)
+
+    canvas.delete(LIVE_TAIL_TAG)
+
+    active_plan = live_tail.trade_plan if live_tail is not None else trade_plan
+    canvas.create_text(
+        viewport_right - 16,
+        height - 10,
+        anchor="se",
+        fill=CHART_TEXT,
+        font=("Segoe UI", 9),
+        tags=(LIVE_TAIL_TAG,),
+        text=f"lots: {active_plan.symbol_1_lots:.2f} / {active_plan.symbol_2_lots:.2f}",
+    )
+
+    if live_tail is not None and not live_tail.bar.empty:
+        _draw_bar(
+            canvas=canvas,
+            row=live_tail.bar.iloc[0],
+            index=len(bars),
+            center_y=center_y,
+            scale=scale,
+            layout=layout,
+            colors={"pair_1_up": "#34d399", "pair_1_down": "#f87171", "pair_2_up": "#60a5fa", "pair_2_down": "#f59e0b"},
+            tags=(LIVE_TAIL_TAG,),
+        )
+        _, _, preview_center_x = pair_positions(len(bars), LEFT_PAD, layout.body_half, layout.pair_gap, layout.pair_width)
+        if live_tail.aggregate_progress and live_tail.aggregate_progress != "1/1":
+            canvas.create_text(
+                preview_center_x,
+                height - 12,
+                anchor="s",
+                fill=CHART_TEXT,
+                font=("Segoe UI", 9),
+                tags=(LIVE_TAIL_TAG,),
+                text=live_tail.aggregate_progress,
+            )
+
+    canvas.configure(scrollregion=(0, 0, total_width, height))
 
 
 def render_candles(
@@ -1914,6 +2262,7 @@ def render_candles(
     selected_start_index: int | None,
     selected_end_index: int | None,
     colors: dict[str, str],
+    live_tail: LiveTailSnapshot | None,
 ) -> None:
     canvas.update_idletasks()
     viewport_width = max(canvas.winfo_width(), 400)
@@ -1925,19 +2274,14 @@ def render_candles(
     canvas.create_rectangle(viewport_left, 0, viewport_right, height, fill=CHART_BG, outline=CHART_BG)
 
     center_y = height / 2
-    top_pad = 56
+    top_pad = 40
     bottom_pad = 34
 
-    n = len(bars)
     layout = pair_layout(width_adjust_px, pair_gap_adjust_px)
-    total_width = max(viewport_width, LEFT_PAD + pair_total_width(n, layout.pair_width, layout.pair_gap) + RIGHT_PAD)
+    total_count = len(bars) + (1 if live_tail is not None and not live_tail.bar.empty else 0)
+    total_width = max(viewport_width, LEFT_PAD + pair_total_width(total_count, layout.pair_width, layout.pair_gap) + RIGHT_PAD)
 
-    max_abs = 1.0
-    for col in ["p1_high", "p1_low", "p1_close", "p2_high", "p2_low", "p2_close"]:
-        val = bars[col].abs().max()
-        if pd.notna(val):
-            max_abs = max(max_abs, float(val))
-
+    max_abs = _max_abs_for_scale(bars, live_tail)
     usable_half = max(40.0, (height - top_pad - bottom_pad) / 2 - 10)
     base_scale = usable_half / (max_abs * 1.15)
     scale = max(0.5, base_scale + height_adjust_px)
@@ -1950,35 +2294,8 @@ def render_candles(
         canvas.create_line(LEFT_PAD, center_y - dy, total_width - RIGHT_PAD, center_y - dy, fill=CHART_GRID)
         canvas.create_line(LEFT_PAD, center_y + dy, total_width - RIGHT_PAD, center_y + dy, fill=CHART_GRID)
 
-    last_points: list[dict[str, float]] = []
     for i, row in bars.iterrows():
-        p1_x, p2_x, _ = pair_positions(i, LEFT_PAD, layout.body_half, layout.pair_gap, layout.pair_width)
-        p1_high_y = center_y - float(row["p1_high"]) * scale
-        p1_low_y = center_y - float(row["p1_low"]) * scale
-        p1_close_y = center_y - float(row["p1_close"]) * scale
-        p2_high_y = center_y - float(row["p2_high"]) * scale
-        p2_low_y = center_y - float(row["p2_low"]) * scale
-        p2_close_y = center_y - float(row["p2_close"]) * scale
-
-        p1_color = colors["pair_1_up"] if float(row["p1_close"]) >= 0 else colors["pair_1_down"]
-        p2_color = colors["pair_2_up"] if float(row["p2_close"]) >= 0 else colors["pair_2_down"]
-
-        canvas.create_line(p1_x, p1_high_y, p1_x, p1_low_y, fill=p1_color, width=1)
-        canvas.create_line(p2_x, p2_high_y, p2_x, p2_low_y, fill=p2_color, width=1)
-        draw_body(canvas, p1_x, center_y, p1_close_y, layout.body_half, p1_color)
-        draw_body(canvas, p2_x, center_y, p2_close_y, layout.body_half, p2_color)
-
-        if i >= max(0, n - 2):
-            last_points.append(
-                {
-                    "p1_x": p1_x,
-                    "p2_x": p2_x,
-                    "p1_high_y": p1_high_y,
-                    "p1_low_y": p1_low_y,
-                    "p2_high_y": p2_high_y,
-                    "p2_low_y": p2_low_y,
-                }
-            )
+        _draw_bar(canvas, row, i, center_y, scale, layout, colors)
 
     draw_selection_on_candles(
         canvas=canvas,
@@ -1995,42 +2312,34 @@ def render_candles(
         selected_end_index=selected_end_index,
     )
 
-    mode_text = "обратная 2-я пара" if invert_second else "обычная 2-я пара"
-    title_x = viewport_left + viewport_width / 2.0
+    relation_text = "авто-инверсия 2-й пары" if invert_second else "одна направленность"
     canvas.create_text(
-        title_x,
+        viewport_left + 12,
         8,
-        anchor="n",
+        anchor="nw",
         fill=CHART_TEXT,
         font=("Segoe UI", 10),
-        text=f"{symbol_1} vs {symbol_2} | {mode_text}",
+        text=f"{symbol_1} vs {symbol_2} | {relation_text}",
     )
-
-    sell_color = "#ef4444"
-    buy_color = "#2563eb"
-    if trade_plan.entry_ready:
-        for point in last_points:
-            if trade_plan.symbol_1_side == "sell":
-                draw_sell_arrow(canvas, float(point["p1_x"]), float(point["p1_high_y"]) - 18, sell_color)
-            elif trade_plan.symbol_1_side == "buy":
-                draw_buy_arrow(canvas, float(point["p1_x"]), float(point["p1_low_y"]) + 18, buy_color, height)
-            if trade_plan.symbol_2_side == "sell":
-                draw_sell_arrow(canvas, float(point["p2_x"]), float(point["p2_high_y"]) - 18, sell_color)
-            elif trade_plan.symbol_2_side == "buy":
-                draw_buy_arrow(canvas, float(point["p2_x"]), float(point["p2_low_y"]) + 18, buy_color, height)
 
     canvas.create_text(
         viewport_right - 16,
-        height - 10,
+        height - 26,
         anchor="se",
         fill=CHART_TEXT,
         font=("Segoe UI", 9),
-        text=(
-            f"{symbol_2} | coef 1/2 = {ratio_1_to_2:.6f} | "
-            f"width={width_adjust_px:+d}px | height={height_adjust_px:+d}px | pair_gap={pair_gap_adjust_px:+d}px"
-        ),
+        text=f"width={width_adjust_px:+d}px | height={height_adjust_px:+d}px | pair_gap={pair_gap_adjust_px:+d}px",
     )
-    canvas.configure(scrollregion=(0, 0, total_width, height))
+
+    update_live_tail_on_candles(
+        canvas=canvas,
+        bars=bars,
+        trade_plan=trade_plan,
+        live_tail=live_tail,
+        width_adjust_px=width_adjust_px,
+        height_adjust_px=height_adjust_px,
+        pair_gap_adjust_px=pair_gap_adjust_px,
+    )
 
 # src/app/ui_relative_compare/ui/chart/chart.py
 from __future__ import annotations
@@ -2039,10 +2348,10 @@ import tkinter as tk
 
 import pandas as pd
 
-from src.app.ui_relative_compare.domain import SignalDiagnostics, TradePlan
-from .candles import render_candles
+from src.app.ui_relative_compare.domain.models import FlowDiagnostics, LiveTailSnapshot, RangeStats, TradePlan
+from .candles import render_candles, update_live_tail_on_candles
 from .layout import LEFT_PAD, pair_layout
-from .lines import render_relative_lines
+from .lines import render_relative_lines, update_live_tail_on_lines
 from .series import build_signal_line_series
 
 
@@ -2069,8 +2378,9 @@ class RelativeChart:
         digits_1: int,
         digits_2: int,
         mutual_exclusion_enabled: bool,
-        signal_diagnostics: SignalDiagnostics,
-        line_chart_mode: str,
+        range_stats: RangeStats,
+        flow_diagnostics: FlowDiagnostics,
+        live_tail: LiveTailSnapshot | None,
     ) -> None:
         render_candles(
             canvas=self.candle_canvas,
@@ -2086,31 +2396,76 @@ class RelativeChart:
             selected_start_index=selected_start_index,
             selected_end_index=selected_end_index,
             colors=colors,
+            live_tail=live_tail,
         )
-        gap, fast_ma, slow_ma = build_signal_line_series(
-            bars,
+
+        line_1, line_2, diff, _, _ = build_signal_line_series(
+            bars=bars,
             digits_1=digits_1,
             digits_2=digits_2,
-            ratio_1_to_2=ratio_1_to_2,
             invert_second=invert_second,
             mutual_exclusion_enabled=mutual_exclusion_enabled,
-            fast_window=signal_diagnostics.fast_window,
-            slow_window=signal_diagnostics.slow_window,
+            range_stats=range_stats,
         )
         render_relative_lines(
             canvas=self.line_canvas,
-            gap=gap,
-            fast_ma=fast_ma,
-            slow_ma=slow_ma,
+            line_1=line_1,
+            line_2=line_2,
+            diff=diff,
             width_adjust_px=width_adjust_px,
             pair_gap_adjust_px=pair_gap_adjust_px,
             selected_start_index=selected_start_index,
             selected_end_index=selected_end_index,
             colors=colors,
             line_zoom=line_zoom,
-            entry_threshold=signal_diagnostics.entry_threshold,
-            exit_threshold=signal_diagnostics.exit_threshold,
-            chart_mode=line_chart_mode,
+            flow_diagnostics=flow_diagnostics,
+            live_tail=live_tail,
+        )
+
+    def update_live_tail(
+        self,
+        bars: pd.DataFrame,
+        trade_plan: TradePlan,
+        live_tail: LiveTailSnapshot | None,
+        width_adjust_px: int,
+        height_adjust_px: int,
+        pair_gap_adjust_px: int,
+        line_zoom: float,
+        digits_1: int,
+        digits_2: int,
+        invert_second: bool,
+        mutual_exclusion_enabled: bool,
+        range_stats: RangeStats,
+        flow_diagnostics: FlowDiagnostics,
+    ) -> None:
+        update_live_tail_on_candles(
+            canvas=self.candle_canvas,
+            bars=bars,
+            trade_plan=trade_plan,
+            live_tail=live_tail,
+            width_adjust_px=width_adjust_px,
+            height_adjust_px=height_adjust_px,
+            pair_gap_adjust_px=pair_gap_adjust_px,
+        )
+
+        line_1, line_2, diff, _, _ = build_signal_line_series(
+            bars=bars,
+            digits_1=digits_1,
+            digits_2=digits_2,
+            invert_second=invert_second,
+            mutual_exclusion_enabled=mutual_exclusion_enabled,
+            range_stats=range_stats,
+        )
+        update_live_tail_on_lines(
+            canvas=self.line_canvas,
+            line_1=line_1,
+            line_2=line_2,
+            diff=diff,
+            flow_diagnostics=flow_diagnostics,
+            live_tail=live_tail,
+            width_adjust_px=width_adjust_px,
+            pair_gap_adjust_px=pair_gap_adjust_px,
+            line_zoom=line_zoom,
         )
 
     def get_index_at_x(self, bars_count: int, x_world: float, width_adjust_px: int, pair_gap_adjust_px: int) -> int | None:
@@ -2168,215 +2523,248 @@ import pandas as pd
 import tkinter as tk
 
 from src.app.ui_relative_compare.constants import CHART_AXIS, CHART_BG, CHART_GRID, CHART_TEXT
+from src.app.ui_relative_compare.domain.models import FlowDiagnostics, LiveTailSnapshot
 from .layout import LEFT_PAD, RIGHT_PAD, pair_layout, pair_positions, pair_total_width
 from .selection import draw_selection_on_line
 
 
-GAP_COLOR = "#6b7280"
-FAST_COLOR = "#22c55e"
-SLOW_COLOR = "#f59e0b"
-DIFF_COLOR = "#22c55e"
-
-
-def _format_value(value: float) -> str:
-    return f"{float(value):+.2f}".rstrip("0").rstrip(".")
+LINE_1_COLOR = "#22c55e"
+LINE_2_COLOR = "#f59e0b"
+DIFF_COLOR = "#6b7280"
+LIVE_TAIL_TAG = "live_tail"
 
 
 def _normalize(series: pd.Series) -> pd.Series:
     return pd.Series(series, dtype=float).reset_index(drop=True)
 
 
-def _extend_points(series: pd.Series, mid_y: float, scale: float, n: int, width_adjust_px: int, pair_gap_adjust_px: int) -> tuple[list[float], float, float]:
+def _format(value: float) -> str:
+    text = f"{float(value):+.2f}".rstrip("0").rstrip(".")
+    return "0" if text == "-0" else text
+
+
+def _plot_base(line_1: pd.Series, line_2: pd.Series, diff: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
+    midpoint = ((line_1 + line_2) / 2.0).astype(float)
+    return (line_1 - midpoint).astype(float), (line_2 - midpoint).astype(float), diff.astype(float)
+
+
+def _extend_points(series: pd.Series, mid_y: float, scale: float, width_adjust_px: int, pair_gap_adjust_px: int) -> tuple[list[float], float]:
     layout = pair_layout(width_adjust_px, pair_gap_adjust_px)
     points: list[float] = []
     last_center_x = 0.0
-    last_y = mid_y
-    for i in range(n):
+    for i in range(len(series)):
         _, _, pair_center_x = pair_positions(i, LEFT_PAD, layout.body_half, layout.pair_gap, layout.pair_width)
         y = mid_y - float(series.iloc[i]) * scale
         points.extend([pair_center_x, y])
         last_center_x = float(pair_center_x)
-        last_y = float(y)
-    return points, last_center_x, last_y
+    return points, last_center_x
 
 
-def _plot_gap_ma_mode(gap: pd.Series, fast_ma: pd.Series, slow_ma: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
-    midpoint = ((fast_ma + slow_ma) / 2.0).astype(float)
-    plot_gap = (gap - midpoint).astype(float)
-    plot_fast = (fast_ma - midpoint).astype(float)
-    plot_slow = (slow_ma - midpoint).astype(float)
-    return plot_gap, plot_fast, plot_slow
+def update_live_tail_on_lines(
+    canvas: tk.Canvas,
+    line_1: pd.Series,
+    line_2: pd.Series,
+    diff: pd.Series,
+    flow_diagnostics: FlowDiagnostics,
+    live_tail: LiveTailSnapshot | None,
+    width_adjust_px: int,
+    pair_gap_adjust_px: int,
+    line_zoom: float,
+) -> None:
+    canvas.update_idletasks()
+    viewport_width = max(canvas.winfo_width(), 400)
+    height = max(canvas.winfo_height(), 140)
+    viewport_left = float(canvas.canvasx(0))
+    viewport_right = viewport_left + float(viewport_width)
 
+    line_1 = _normalize(line_1)
+    line_2 = _normalize(line_2)
+    diff = _normalize(diff)
 
-def _plot_gap_diff_mode(gap: pd.Series, fast_ma: pd.Series, slow_ma: pd.Series) -> tuple[pd.Series, pd.Series]:
-    diff = (fast_ma - slow_ma).astype(float)
-    return gap.astype(float), diff
+    plot_1, plot_2, plot_diff = _plot_base(line_1, line_2, diff)
+    layout = pair_layout(width_adjust_px, pair_gap_adjust_px)
+
+    max_abs = 1.0
+    series_for_scale = [plot_1, plot_2, plot_diff]
+    if not plot_diff.empty:
+        for series in series_for_scale:
+            max_abs = max(max_abs, float(series.abs().max()))
+    elif live_tail is not None:
+        max_abs = max(
+            max_abs,
+            abs(float(live_tail.flow_diagnostics.line_1_last)),
+            abs(float(live_tail.flow_diagnostics.line_2_last)),
+            abs(float(live_tail.flow_diagnostics.diff_last)),
+        )
+
+    top_pad = 18
+    bottom_pad = 22
+    mid_y = height / 2
+    usable_half = max(22.0, (height - top_pad - bottom_pad) / 2)
+    scale = usable_half / (max_abs * 1.1)
+    scale *= max(0.2, min(8.0, float(line_zoom or 1.0)))
+
+    total_count = len(plot_diff) + (1 if live_tail is not None and not live_tail.bar.empty else 0)
+    total_width = max(viewport_width, LEFT_PAD + pair_total_width(total_count, layout.pair_width, layout.pair_gap) + RIGHT_PAD)
+
+    canvas.delete(LIVE_TAIL_TAG)
+
+    display_flow = live_tail.flow_diagnostics if live_tail is not None else flow_diagnostics
+    canvas.create_text(
+        viewport_left + 10,
+        8,
+        anchor="nw",
+        fill=CHART_TEXT,
+        font=("Segoe UI", 9),
+        tags=(LIVE_TAIL_TAG,),
+        text=(
+            f"ход 1 (green) | ход 2 (orange) | diff (gray) | "
+            f"long coef={display_flow.applied_ratio_long:.3f} short coef={display_flow.applied_ratio_short:.3f} | "
+            f"diff={_format(display_flow.diff_last)}"
+        ),
+    )
+
+    last_x_for_text = 0.0
+    if not plot_diff.empty:
+        _, last_x_for_text = _extend_points(plot_diff, mid_y, scale, width_adjust_px, pair_gap_adjust_px)
+
+    if live_tail is not None and not live_tail.bar.empty:
+        preview_index = len(plot_diff)
+        _, _, preview_x = pair_positions(preview_index, LEFT_PAD, layout.body_half, layout.pair_gap, layout.pair_width)
+
+        preview_mid = (float(display_flow.line_1_last) + float(display_flow.line_2_last)) / 2.0
+        preview_y_1 = mid_y - (float(display_flow.line_1_last) - preview_mid) * scale
+        preview_y_2 = mid_y - (float(display_flow.line_2_last) - preview_mid) * scale
+        preview_y_diff = mid_y - float(display_flow.diff_last) * scale
+
+        if len(plot_diff) > 0:
+            _, _, last_center_x = pair_positions(len(plot_diff) - 1, LEFT_PAD, layout.body_half, layout.pair_gap, layout.pair_width)
+            last_y_1 = mid_y - float(plot_1.iloc[-1]) * scale
+            last_y_2 = mid_y - float(plot_2.iloc[-1]) * scale
+            last_y_diff = mid_y - float(plot_diff.iloc[-1]) * scale
+
+            canvas.create_line(last_center_x, last_y_1, preview_x, preview_y_1, fill=LINE_1_COLOR, width=2, tags=(LIVE_TAIL_TAG,))
+            canvas.create_line(last_center_x, last_y_2, preview_x, preview_y_2, fill=LINE_2_COLOR, width=2, tags=(LIVE_TAIL_TAG,))
+            canvas.create_line(last_center_x, last_y_diff, preview_x, preview_y_diff, fill=DIFF_COLOR, width=1, tags=(LIVE_TAIL_TAG,))
+        else:
+            canvas.create_line(preview_x, mid_y, preview_x, preview_y_1, fill=LINE_1_COLOR, width=2, tags=(LIVE_TAIL_TAG,))
+            canvas.create_line(preview_x, mid_y, preview_x, preview_y_2, fill=LINE_2_COLOR, width=2, tags=(LIVE_TAIL_TAG,))
+            canvas.create_line(preview_x, mid_y, preview_x, preview_y_diff, fill=DIFF_COLOR, width=1, tags=(LIVE_TAIL_TAG,))
+
+        last_x_for_text = preview_x
+        if live_tail.aggregate_progress and live_tail.aggregate_progress != "1/1":
+            canvas.create_text(
+                preview_x,
+                height - 10,
+                anchor="s",
+                fill=CHART_TEXT,
+                font=("Segoe UI", 9),
+                tags=(LIVE_TAIL_TAG,),
+                text=live_tail.aggregate_progress,
+            )
+
+    if total_count > 0:
+        canvas.create_text(
+            last_x_for_text,
+            16,
+            anchor="n",
+            fill=CHART_TEXT,
+            font=("Segoe UI", 10, "bold"),
+            tags=(LIVE_TAIL_TAG,),
+            text=f"{_format(display_flow.line_1_last)} | {_format(display_flow.line_2_last)} | diff {_format(display_flow.diff_last)}",
+        )
+
+    canvas.configure(scrollregion=(0, 0, total_width, height))
 
 
 def render_relative_lines(
     canvas: tk.Canvas,
-    gap: pd.Series,
-    fast_ma: pd.Series,
-    slow_ma: pd.Series,
+    line_1: pd.Series,
+    line_2: pd.Series,
+    diff: pd.Series,
     width_adjust_px: int,
     pair_gap_adjust_px: int,
     selected_start_index: int | None,
     selected_end_index: int | None,
     colors: dict[str, str],
     line_zoom: float,
-    entry_threshold: float,
-    exit_threshold: float,
-    chart_mode: str,
+    flow_diagnostics: FlowDiagnostics,
+    live_tail: LiveTailSnapshot | None,
 ) -> None:
     canvas.update_idletasks()
     viewport_width = max(canvas.winfo_width(), 400)
-    height = max(canvas.winfo_height(), 120)
+    height = max(canvas.winfo_height(), 140)
     viewport_left = float(canvas.canvasx(0))
     viewport_right = viewport_left + float(viewport_width)
 
     canvas.delete("all")
     canvas.create_rectangle(viewport_left, 0, viewport_right, height, fill=CHART_BG, outline=CHART_BG)
 
-    gap = _normalize(gap)
-    fast_ma = _normalize(fast_ma)
-    slow_ma = _normalize(slow_ma)
+    line_1 = _normalize(line_1)
+    line_2 = _normalize(line_2)
+    diff = _normalize(diff)
+
+    plot_1, plot_2, plot_diff = _plot_base(line_1, line_2, diff)
 
     top_pad = 18
     bottom_pad = 22
-    n = len(gap)
     layout = pair_layout(width_adjust_px, pair_gap_adjust_px)
-    total_width = max(viewport_width, LEFT_PAD + pair_total_width(n, layout.pair_width, layout.pair_gap) + RIGHT_PAD)
-
-    mode = chart_mode if chart_mode in {"gap_ma", "gap_diff"} else "gap_ma"
-    if mode == "gap_diff":
-        plot_gap, plot_diff = _plot_gap_diff_mode(gap, fast_ma, slow_ma)
-        plot_slow = pd.Series(dtype=float)
-        series_for_scale = [plot_gap, plot_diff]
-    else:
-        plot_gap, plot_fast, plot_slow = _plot_gap_ma_mode(gap, fast_ma, slow_ma)
-        series_for_scale = [plot_gap, plot_fast, plot_slow]
+    total_count = len(plot_diff) + (1 if live_tail is not None and not live_tail.bar.empty else 0)
+    total_width = max(viewport_width, LEFT_PAD + pair_total_width(total_count, layout.pair_width, layout.pair_gap) + RIGHT_PAD)
 
     max_abs = 1.0
-    for series in series_for_scale:
+    for series in (plot_1, plot_2, plot_diff):
         if not series.empty:
             max_abs = max(max_abs, float(series.abs().max()))
 
-    if mode == "gap_diff":
-        max_abs = max(max_abs, abs(float(entry_threshold)), abs(float(exit_threshold)))
-
     mid_y = height / 2
-    usable_half = max(20.0, (height - top_pad - bottom_pad) / 2)
+    usable_half = max(22.0, (height - top_pad - bottom_pad) / 2)
     scale = usable_half / (max_abs * 1.1)
     scale *= max(0.2, min(8.0, float(line_zoom or 1.0)))
 
     canvas.create_line(LEFT_PAD, mid_y, total_width - RIGHT_PAD, mid_y, fill=CHART_AXIS, width=1)
     canvas.create_text(12, mid_y, anchor="w", text="0", fill=CHART_AXIS, font=("Segoe UI", 9, "bold"))
-
     for level in [0.5, 1.0]:
         dy = max_abs * (usable_half / (max_abs * 1.1)) * level
         canvas.create_line(LEFT_PAD, mid_y - dy, total_width - RIGHT_PAD, mid_y - dy, fill=CHART_GRID)
         canvas.create_line(LEFT_PAD, mid_y + dy, total_width - RIGHT_PAD, mid_y + dy, fill=CHART_GRID)
 
-    if mode == "gap_diff":
-        entry_y_top = mid_y - float(entry_threshold) * scale
-        entry_y_bottom = mid_y + float(entry_threshold) * scale
-        exit_y_top = mid_y - float(exit_threshold) * scale
-        exit_y_bottom = mid_y + float(exit_threshold) * scale
-        canvas.create_line(LEFT_PAD, entry_y_top, total_width - RIGHT_PAD, entry_y_top, fill="#7f1d1d", dash=(4, 3))
-        canvas.create_line(LEFT_PAD, entry_y_bottom, total_width - RIGHT_PAD, entry_y_bottom, fill="#7f1d1d", dash=(4, 3))
-        canvas.create_line(LEFT_PAD, exit_y_top, total_width - RIGHT_PAD, exit_y_top, fill="#1f2937", dash=(2, 3))
-        canvas.create_line(LEFT_PAD, exit_y_bottom, total_width - RIGHT_PAD, exit_y_bottom, fill="#1f2937", dash=(2, 3))
+    diff_points, _ = _extend_points(plot_diff, mid_y, scale, width_adjust_px, pair_gap_adjust_px)
+    line_1_points, _ = _extend_points(plot_1, mid_y, scale, width_adjust_px, pair_gap_adjust_px)
+    line_2_points, _ = _extend_points(plot_2, mid_y, scale, width_adjust_px, pair_gap_adjust_px)
 
-    gap_points, last_center_x, last_gap_y = _extend_points(plot_gap, mid_y, scale, n, width_adjust_px, pair_gap_adjust_px)
+    if len(diff_points) >= 4:
+        canvas.create_line(*diff_points, fill=DIFF_COLOR, width=1, smooth=False)
+    if len(line_1_points) >= 4:
+        canvas.create_line(*line_1_points, fill=LINE_1_COLOR, width=2, smooth=False)
+    if len(line_2_points) >= 4:
+        canvas.create_line(*line_2_points, fill=LINE_2_COLOR, width=2, smooth=False)
 
-    if len(gap_points) >= 4:
-        canvas.create_line(*gap_points, fill=GAP_COLOR, width=1, smooth=False)
+    draw_selection_on_line(
+        canvas=canvas,
+        line_1=plot_1,
+        line_2=plot_2,
+        body_half=layout.body_half,
+        pair_gap=layout.pair_gap,
+        pair_width=layout.pair_width,
+        mid_y=mid_y,
+        scale=scale,
+        height=height,
+        selected_start_index=selected_start_index,
+        selected_end_index=selected_end_index,
+    )
 
-    if mode == "gap_diff":
-        diff_points, _, last_diff_y = _extend_points(plot_diff, mid_y, scale, n, width_adjust_px, pair_gap_adjust_px)
-        if len(diff_points) >= 4:
-            canvas.create_line(*diff_points, fill=DIFF_COLOR, width=2, smooth=False)
-
-        if n > 0 and not plot_diff.empty:
-            diff_value = float(plot_diff.iloc[-1])
-            top_y = min(last_gap_y, last_diff_y)
-            canvas.create_text(
-                last_center_x,
-                max(12.0, top_y - 10.0),
-                anchor="s",
-                text=f"diff {_format_value(diff_value)}",
-                fill=CHART_TEXT,
-                font=("Segoe UI", 10, "bold"),
-            )
-
-        canvas.create_text(
-            viewport_left + 10,
-            8,
-            anchor="nw",
-            fill=CHART_TEXT,
-            font=("Segoe UI", 9),
-            text=f"mode: gap + diff | gap(gray) | diff(green) | entry={entry_threshold:.2f} exit={exit_threshold:.2f}",
-        )
-
-        draw_selection_on_line(
-            canvas=canvas,
-            line_1=plot_gap,
-            line_2=plot_diff,
-            body_half=layout.body_half,
-            pair_gap=layout.pair_gap,
-            pair_width=layout.pair_width,
-            mid_y=mid_y,
-            scale=scale,
-            height=height,
-            selected_start_index=selected_start_index,
-            selected_end_index=selected_end_index,
-        )
-    else:
-        fast_points, _, last_fast_y = _extend_points(plot_fast, mid_y, scale, n, width_adjust_px, pair_gap_adjust_px)
-        slow_points, _, last_slow_y = _extend_points(plot_slow, mid_y, scale, n, width_adjust_px, pair_gap_adjust_px)
-
-        if len(fast_points) >= 4:
-            canvas.create_line(*fast_points, fill=FAST_COLOR, width=2, smooth=False)
-        if len(slow_points) >= 4:
-            canvas.create_line(*slow_points, fill=SLOW_COLOR, width=2, smooth=False)
-
-        if n > 0 and not fast_ma.empty and not slow_ma.empty and not gap.empty:
-            diff_value = float(fast_ma.iloc[-1] - slow_ma.iloc[-1])
-            gap_value = float(gap.iloc[-1])
-            top_y = min(last_gap_y, last_fast_y, last_slow_y)
-            canvas.create_text(
-                last_center_x,
-                max(12.0, top_y - 10.0),
-                anchor="s",
-                text=f"gap {_format_value(gap_value)} | diff {_format_value(diff_value)}",
-                fill=CHART_TEXT,
-                font=("Segoe UI", 10, "bold"),
-            )
-
-        canvas.create_text(
-            viewport_left + 10,
-            8,
-            anchor="nw",
-            fill=CHART_TEXT,
-            font=("Segoe UI", 9),
-            text="mode: centered gap + fast + slow | общий дрейф убран | gap(gray) | fast(green) | slow(orange)",
-        )
-
-        draw_selection_on_line(
-            canvas=canvas,
-            line_1=plot_fast,
-            line_2=plot_slow,
-            body_half=layout.body_half,
-            pair_gap=layout.pair_gap,
-            pair_width=layout.pair_width,
-            mid_y=mid_y,
-            scale=scale,
-            height=height,
-            selected_start_index=selected_start_index,
-            selected_end_index=selected_end_index,
-        )
-
-    canvas.configure(scrollregion=(0, 0, total_width, height))
+    update_live_tail_on_lines(
+        canvas=canvas,
+        line_1=line_1,
+        line_2=line_2,
+        diff=diff,
+        flow_diagnostics=flow_diagnostics,
+        live_tail=live_tail,
+        width_adjust_px=width_adjust_px,
+        pair_gap_adjust_px=pair_gap_adjust_px,
+        line_zoom=line_zoom,
+    )
 
 # src/app/ui_relative_compare/ui/chart/primitives.py
 from __future__ import annotations
@@ -2486,6 +2874,7 @@ from __future__ import annotations
 
 import pandas as pd
 
+from src.app.ui_relative_compare.domain import RangeStats
 from src.app.ui_relative_compare.services.market.signal import build_signal_plot_series
 
 
@@ -2493,23 +2882,19 @@ def build_signal_line_series(
     bars: pd.DataFrame,
     digits_1: int,
     digits_2: int,
-    ratio_1_to_2: float,
     invert_second: bool,
     mutual_exclusion_enabled: bool,
-    fast_window: int,
-    slow_window: int,
-) -> tuple[pd.Series, pd.Series, pd.Series]:
+    range_stats: RangeStats,
+) -> tuple[pd.Series, pd.Series, pd.Series, float, float]:
     plot = build_signal_plot_series(
         bars=bars,
         digits_1=digits_1,
         digits_2=digits_2,
-        ratio_1_to_2=ratio_1_to_2,
         invert_second=invert_second,
         mutual_exclusion_enabled=mutual_exclusion_enabled,
-        fast_window=fast_window,
-        slow_window=slow_window,
+        range_stats=range_stats,
     )
-    return plot.gap, plot.fast_ma, plot.slow_ma
+    return plot.line_1, plot.line_2, plot.diff, plot.applied_ratio_long, plot.applied_ratio_short
 
 # src/app/ui_relative_compare/ui/controller/__init__.py
 from .base import RelativeCompareController
@@ -2549,6 +2934,10 @@ class RelativeCompareController(
         self.state_save_job: str | None = None
         self.current_snapshot: RenderSnapshot | None = None
         self.selection = SelectionState()
+
+        self.live_last_bar_time = None
+        self.live_base_visible_bars: int | None = None
+        self.live_effective_bars: int | None = None
 
         self.drag_start_x = 0
         self.drag_active = False
@@ -2626,8 +3015,15 @@ class ControllerLayoutMixin:
         return "break"
 
     def update_pane_toggle_labels(self) -> None:
+        self.view.sizing_toggle_var.set("▸" if self.view.sizing_collapsed else "▾")
         self.view.candle_toggle_var.set("▸" if self.view.candle_collapsed else "▾")
         self.view.line_toggle_var.set("▸" if self.view.line_collapsed else "▾")
+
+    def toggle_sizing_panel(self) -> None:
+        self.view.sizing_collapsed = not self.view.sizing_collapsed
+        self.update_pane_toggle_labels()
+        self.view.set_panel_body_visible(self.view.sizing_body, not self.view.sizing_collapsed)
+        self.schedule_state_save()
 
     def toggle_candle_panel(self) -> None:
         if not self.view.candle_collapsed:
@@ -2649,6 +3045,7 @@ class ControllerLayoutMixin:
             self.update_pane_toggle_labels()
             self.view.set_panel_body_visible(self.view.candle_body, not self.view.candle_collapsed)
             self.view.set_panel_body_visible(self.view.line_body, not self.view.line_collapsed)
+            self.view.set_panel_body_visible(self.view.sizing_body, not self.view.sizing_collapsed)
 
             total_height = max(int(self.view.chart_panes.winfo_height()), 380)
             candle_min = PANE_MIN_COLLAPSED if self.view.candle_collapsed else PANE_MIN_EXPANDED_TOP
@@ -2676,14 +3073,14 @@ class ControllerLayoutMixin:
             self.view.height_size_var.set(f"{self.view.height_adjust_px:+d}px")
         self.schedule_state_save()
         if self.current_snapshot is not None:
-            self.render_once()
+            self.redraw_current_snapshot()
 
     def change_pair_gap(self, delta: int) -> None:
         self.view.pair_gap_adjust_px += delta
         self.view.pair_gap_size_var.set(f"{self.view.pair_gap_adjust_px:+d}px")
         self.schedule_state_save()
         if self.current_snapshot is not None:
-            self.render_once()
+            self.redraw_current_snapshot()
 
     def reset_size(self) -> None:
         self.view.width_adjust_px = 0
@@ -2694,7 +3091,7 @@ class ControllerLayoutMixin:
         self.view.pair_gap_size_var.set("0px")
         self.schedule_state_save()
         if self.current_snapshot is not None:
-            self.render_once()
+            self.redraw_current_snapshot()
 
 # src/app/ui_relative_compare/ui/controller/lifecycle.py
 from __future__ import annotations
@@ -2714,7 +3111,7 @@ class ControllerLifecycleMixin:
 
     def live_tick(self) -> None:
         try:
-            self.render_once()
+            self.render_once(from_live=True)
         except Exception:
             pass
         finally:
@@ -2743,6 +3140,7 @@ class ControllerLifecycleMixin:
 # src/app/ui_relative_compare/ui/controller/render.py
 from __future__ import annotations
 
+import pandas as pd
 from tkinter import messagebox
 
 from src.app.ui_relative_compare.constants import TIMEFRAME_MINUTES
@@ -2755,9 +3153,7 @@ class ControllerRenderMixin:
             if self.connected:
                 self.view.status_var.set("connected")
                 return
-
             from src.broker.mt5_client import MT5Client
-
             self.client = MT5Client(self.base_cfg)
             self.client.connect()
             self.connected = True
@@ -2780,131 +3176,263 @@ class ControllerRenderMixin:
         timeframe = self.view.timeframe_var.get().strip()
         if timeframe not in TIMEFRAME_MINUTES:
             raise RuntimeError("Неподдерживаемый timeframe")
-
-        visible_bars = max(20, int(self.view.visible_bars_var.get().strip() or "120"))
+        visible_bars = max(20, int(self.view.visible_bars_var.get().strip() or "1200"))
         refresh_ms = max(100, int(self.view.refresh_ms_var.get().strip() or "250"))
         aggregate_bars = max(1, int(self.view.aggregate_bars_var.get().strip() or "1"))
-
         if symbol_1 == symbol_2:
             raise RuntimeError("Нужно выбрать две разные пары")
         return symbol_1, symbol_2, timeframe, visible_bars, refresh_ms, aggregate_bars
 
-    def read_positive_lot(self, raw: str, symbol: str) -> float:
+    def _read_positive_float(self, raw: str, label: str) -> float:
         text = str(raw).strip().replace(",", ".")
         value = float(text)
         if value <= 0:
-            raise RuntimeError(f"Объем для {symbol} должен быть больше 0")
+            raise RuntimeError(f"{label} должен быть больше 0")
         return value
 
-    def read_manual_ratio(self) -> float:
-        text = str(self.view.manual_ratio_1_to_2_var.get()).strip().replace(",", ".")
-        value = float(text)
-        if value <= 0:
-            raise RuntimeError("Коэффициент 1/2 должен быть больше 0")
-        return value
+    def _latest_common_bar_time(self, symbol_1: str, symbol_2: str, timeframe: str):
+        assert self.client is not None
+        frame_1 = self.client.copy_rates(symbol_1, timeframe, 3)[["time"]].copy()
+        frame_2 = self.client.copy_rates(symbol_2, timeframe, 3)[["time"]].copy()
+        merged = pd.merge(frame_1, frame_2, on="time", how="inner")
+        return None if merged.empty else merged.iloc[-1]["time"]
 
-    def read_signal_params(self) -> tuple[int, int, float, float]:
-        fast_window = max(1, int(str(self.view.signal_fast_ma_var.get()).strip() or "8"))
-        slow_window = max(fast_window + 1, int(str(self.view.signal_slow_ma_var.get()).strip() or "34"))
-        entry_threshold = abs(float(str(self.view.signal_entry_threshold_var.get()).strip().replace(",", ".") or "12.0"))
-        exit_threshold = abs(float(str(self.view.signal_exit_threshold_var.get()).strip().replace(",", ".") or "3.0"))
-        return fast_window, slow_window, entry_threshold, exit_threshold
+    def _count_new_bars(self, previous_time, latest_time, timeframe: str) -> int:
+        if previous_time is None or latest_time is None:
+            return 0
+        prev_ts = pd.Timestamp(previous_time)
+        latest_ts = pd.Timestamp(latest_time)
+        if latest_ts <= prev_ts:
+            return 0
+        return max(1, int((latest_ts - prev_ts) / pd.Timedelta(minutes=TIMEFRAME_MINUTES[timeframe])))
 
-    def resolve_pair_lots(self, strict: bool = True) -> tuple[float, float]:
-        symbol_1 = self.view.symbol_1_var.get().strip() or "EURUSD"
-        symbol_2 = self.view.symbol_2_var.get().strip() or "AUDUSD"
+    def _active_plan_side(self) -> str:
+        if self.current_snapshot is None:
+            return "flat"
+        if self.current_snapshot.live_tail is not None:
+            return self.current_snapshot.live_tail.trade_plan.symbol_1_side
+        return self.current_snapshot.trade_plan.symbol_1_side
 
-        if self.view.auto_volume_var.get():
-            if self.current_snapshot is not None:
-                return (
-                    float(self.current_snapshot.trade_plan.symbol_1_lots),
-                    float(self.current_snapshot.trade_plan.symbol_2_lots),
-                )
-            ratio_1_to_2 = self.read_manual_ratio()
-            return float(self.base_cfg.base_lot_eurusd), float(self.base_cfg.base_lot_eurusd * ratio_1_to_2)
+    def _ratio_lot_factor_for_side(self, side: str) -> float:
+        if self.current_snapshot is None:
+            return 1.0
+        stats = self.current_snapshot.range_stats
+        if stats.apply_common:
+            return float(stats.common_ratio)
+        if side == "buy" and stats.apply_long:
+            return float(stats.long_ratio)
+        if side == "sell" and stats.apply_short:
+            return float(stats.short_ratio)
+        return 1.0
 
-        try:
-            return (
-                self.read_positive_lot(self.view.manual_lot_1_var.get(), symbol_1),
-                self.read_positive_lot(self.view.manual_lot_2_var.get(), symbol_2),
-            )
-        except Exception:
-            if strict:
-                raise
-            return 0.0, 0.0
+    def resolve_pair_lots(self, side_for_pair_1: str | None = None) -> tuple[float, float]:
+        base_lot = self._read_positive_float(self.view.base_trading_lot_var.get(), "Базовый торговый лот")
+        cost_1 = self._read_positive_float(self.view.cost_coeff_1_var.get(), "Коэффициент стоимости 1") if self.view.cost_coeff_1_enabled_var.get() else 1.0
+        cost_2 = self._read_positive_float(self.view.cost_coeff_2_var.get(), "Коэффициент стоимости 2") if self.view.cost_coeff_2_enabled_var.get() else 1.0
+        side = side_for_pair_1 or self._active_plan_side()
+        ratio_2 = self._ratio_lot_factor_for_side(side)
+        return float(base_lot * cost_1), float(base_lot * cost_2 * ratio_2)
 
-    def render_once(self) -> None:
+    def _restore_scroll_after_redraw(self, prev_left: float, prev_right: float, had_snapshot: bool) -> None:
+        if not had_snapshot:
+            self.sync_canvas_view(1.0)
+        elif prev_left <= 0.001:
+            self.sync_canvas_view(0.0)
+        elif prev_right >= 0.999:
+            self.sync_canvas_view(1.0)
+        else:
+            self.sync_canvas_view(prev_left)
+
+    def _should_full_rerender_on_new_raw_bar(self, aggregate_bars: int) -> bool:
+        if aggregate_bars <= 1:
+            return True
+        if self.current_snapshot is None or self.current_snapshot.live_tail is None:
+            return True
+        return int(self.current_snapshot.live_tail.source_count) >= int(aggregate_bars)
+
+    def _build_snapshot(
+        self,
+        symbol_1: str,
+        symbol_2: str,
+        timeframe: str,
+        bars_count: int,
+        aggregate_bars: int,
+        base_lot: float,
+        lot_multiplier_1: float,
+        lot_multiplier_2: float,
+        use_live_ticks: bool,
+    ):
+        assert self.client is not None
+        return build_render_snapshot(
+            client=self.client,
+            symbol_1=symbol_1,
+            symbol_2=symbol_2,
+            timeframe=timeframe,
+            bars_count=bars_count,
+            bars_per_candle=aggregate_bars,
+            mutual_exclusion_enabled=bool(self.view.mutual_exclusion_var.get()),
+            base_lot=base_lot,
+            lot_multiplier_1=lot_multiplier_1,
+            lot_multiplier_2=lot_multiplier_2,
+            apply_long_ratio=bool(self.view.apply_long_ratio_var.get()),
+            apply_short_ratio=bool(self.view.apply_short_ratio_var.get()),
+            apply_common_ratio=bool(self.view.apply_common_ratio_var.get()),
+            use_live_ticks=use_live_ticks,
+        )
+
+    def _apply_full_snapshot(self, snapshot, symbol_1: str, symbol_2: str, timeframe: str, aggregate_bars: int, prev_left: float, prev_right: float, had_snapshot: bool, from_live: bool) -> None:
+        self.current_snapshot = snapshot
+        if snapshot.bars.empty and snapshot.live_tail is None:
+            return
+
+        self.selection.resolve_indices(snapshot.bars)
+        self.view.aggregate_info_var.set(f"{timeframe} x {aggregate_bars} | {len(snapshot.bars)} закрытых свечей")
+        if snapshot.live_tail is not None and not snapshot.live_tail.bar.empty:
+            self.view.last_bar_time_var.set(str(snapshot.live_tail.bar.iloc[-1]["time"]))
+        elif not snapshot.bars.empty:
+            self.view.last_bar_time_var.set(str(snapshot.bars.iloc[-1]["time"]))
+        else:
+            self.view.last_bar_time_var.set("-")
+
+        self.view.auto_relation_var.set("обратная" if snapshot.negative_correlation else "прямая")
+        self.update_range_stats()
+        self.update_final_lots_preview()
+
+        self.chart.draw(
+            bars=snapshot.bars,
+            symbol_1=symbol_1,
+            symbol_2=symbol_2,
+            ratio_1_to_2=snapshot.ratio_1_to_2,
+            invert_second=snapshot.negative_correlation,
+            width_adjust_px=self.view.width_adjust_px,
+            height_adjust_px=self.view.height_adjust_px,
+            pair_gap_adjust_px=self.view.pair_gap_adjust_px,
+            trade_plan=snapshot.trade_plan,
+            selected_start_index=self.selection.start_index,
+            selected_end_index=self.selection.end_index,
+            colors=self.view.chart_colors,
+            line_zoom=float(self.view.line_zoom_var.get()),
+            digits_1=snapshot.digits_1,
+            digits_2=snapshot.digits_2,
+            mutual_exclusion_enabled=bool(self.view.mutual_exclusion_var.get()),
+            range_stats=snapshot.range_stats,
+            flow_diagnostics=snapshot.flow_diagnostics,
+            live_tail=snapshot.live_tail,
+        )
+
+        self.view.update_idletasks()
+        self._restore_scroll_after_redraw(prev_left, prev_right, had_snapshot)
+        self.view.status_var.set("live" if from_live else "rendered")
+        self.update_trade_hint()
+        self.update_selection_stats()
+        self.schedule_state_save()
+
+    def _apply_live_tail_only(self, preview_snapshot, from_live: bool) -> None:
+        if self.current_snapshot is None:
+            return
+
+        self.current_snapshot.live_tail = preview_snapshot.live_tail
+
+        if self.current_snapshot.live_tail is not None and not self.current_snapshot.live_tail.bar.empty:
+            self.view.last_bar_time_var.set(str(self.current_snapshot.live_tail.bar.iloc[-1]["time"]))
+
+        self.chart.update_live_tail(
+            bars=self.current_snapshot.bars,
+            trade_plan=self.current_snapshot.trade_plan,
+            live_tail=self.current_snapshot.live_tail,
+            width_adjust_px=self.view.width_adjust_px,
+            height_adjust_px=self.view.height_adjust_px,
+            pair_gap_adjust_px=self.view.pair_gap_adjust_px,
+            line_zoom=float(self.view.line_zoom_var.get()),
+            digits_1=self.current_snapshot.digits_1,
+            digits_2=self.current_snapshot.digits_2,
+            invert_second=self.current_snapshot.negative_correlation,
+            mutual_exclusion_enabled=bool(self.view.mutual_exclusion_var.get()),
+            range_stats=self.current_snapshot.range_stats,
+            flow_diagnostics=self.current_snapshot.flow_diagnostics,
+        )
+        self.view.status_var.set("live" if from_live else "rendered")
+        self.update_trade_hint()
+
+    def render_once(self, from_live: bool = False) -> None:
         try:
             self.ensure_connected()
             assert self.client is not None
 
             symbol_1, symbol_2, timeframe, visible_bars, _, aggregate_bars = self.read_inputs()
-            manual_ratio_1_to_2 = self.read_manual_ratio()
-            fast_window, slow_window, entry_threshold, exit_threshold = self.read_signal_params()
-            invert_second = bool(self.view.negative_correlation_var.get())
+            base_lot = self._read_positive_float(self.view.base_trading_lot_var.get(), "Базовый торговый лот")
+            lot_multiplier_1 = self._read_positive_float(self.view.cost_coeff_1_var.get(), "Коэффициент стоимости 1") if self.view.cost_coeff_1_enabled_var.get() else 1.0
+            lot_multiplier_2 = self._read_positive_float(self.view.cost_coeff_2_var.get(), "Коэффициент стоимости 2") if self.view.cost_coeff_2_enabled_var.get() else 1.0
 
-            prev_x = self.view.candle_canvas.xview()[0]
+            prev_left, prev_right = self.view.candle_canvas.xview()
             had_snapshot = self.current_snapshot is not None
 
-            snapshot = build_render_snapshot(
-                client=self.client,
-                cfg=self.base_cfg,
+            requested_changed = self.live_base_visible_bars != visible_bars
+            full_reset = (not from_live) or (self.current_snapshot is None) or requested_changed
+
+            if full_reset:
+                self.live_base_visible_bars = visible_bars
+                self.live_effective_bars = visible_bars
+
+                snapshot = self._build_snapshot(
+                    symbol_1=symbol_1,
+                    symbol_2=symbol_2,
+                    timeframe=timeframe,
+                    bars_count=int(self.live_effective_bars),
+                    aggregate_bars=aggregate_bars,
+                    base_lot=base_lot,
+                    lot_multiplier_1=lot_multiplier_1,
+                    lot_multiplier_2=lot_multiplier_2,
+                    use_live_ticks=bool(from_live),
+                )
+                self.live_last_bar_time = self._latest_common_bar_time(symbol_1, symbol_2, timeframe)
+                self._apply_full_snapshot(snapshot, symbol_1, symbol_2, timeframe, aggregate_bars, prev_left, prev_right, had_snapshot, from_live)
+                return
+
+            latest_common_time = self._latest_common_bar_time(symbol_1, symbol_2, timeframe)
+            new_raw_bars = self._count_new_bars(self.live_last_bar_time, latest_common_time, timeframe)
+
+            if new_raw_bars > 0:
+                self.live_effective_bars = int(self.live_effective_bars or visible_bars) + int(new_raw_bars)
+                self.live_last_bar_time = latest_common_time
+
+            if new_raw_bars > 0 and self._should_full_rerender_on_new_raw_bar(aggregate_bars):
+                snapshot = self._build_snapshot(
+                    symbol_1=symbol_1,
+                    symbol_2=symbol_2,
+                    timeframe=timeframe,
+                    bars_count=int(self.live_effective_bars or visible_bars),
+                    aggregate_bars=aggregate_bars,
+                    base_lot=base_lot,
+                    lot_multiplier_1=lot_multiplier_1,
+                    lot_multiplier_2=lot_multiplier_2,
+                    use_live_ticks=True,
+                )
+                self._apply_full_snapshot(snapshot, symbol_1, symbol_2, timeframe, aggregate_bars, prev_left, prev_right, had_snapshot, from_live)
+                return
+
+            preview_snapshot = self._build_snapshot(
                 symbol_1=symbol_1,
                 symbol_2=symbol_2,
                 timeframe=timeframe,
-                bars_count=visible_bars,
-                ratio_1_to_2=manual_ratio_1_to_2,
-                bars_per_candle=aggregate_bars,
-                mutual_exclusion_enabled=bool(self.view.mutual_exclusion_var.get()),
-                signal_fast_window=fast_window,
-                signal_slow_window=slow_window,
-                signal_entry_threshold=entry_threshold,
-                signal_exit_threshold=exit_threshold,
-                invert_second=invert_second,
+                bars_count=int(self.live_effective_bars or visible_bars),
+                aggregate_bars=aggregate_bars,
+                base_lot=base_lot,
+                lot_multiplier_1=lot_multiplier_1,
+                lot_multiplier_2=lot_multiplier_2,
+                use_live_ticks=True,
             )
-            self.current_snapshot = snapshot
-            if snapshot.bars.empty:
-                return
-
-            self.selection.resolve_indices(snapshot.bars)
-            self.view.aggregate_info_var.set(f"{timeframe} x {aggregate_bars} | {len(snapshot.bars)} свечей")
-            self.view.last_bar_time_var.set(str(snapshot.bars.iloc[-1]["time"]))
-
-            self.chart.draw(
-                bars=snapshot.bars,
-                symbol_1=symbol_1,
-                symbol_2=symbol_2,
-                ratio_1_to_2=snapshot.ratio_1_to_2,
-                invert_second=snapshot.negative_correlation,
-                width_adjust_px=self.view.width_adjust_px,
-                height_adjust_px=self.view.height_adjust_px,
-                pair_gap_adjust_px=self.view.pair_gap_adjust_px,
-                trade_plan=snapshot.trade_plan,
-                selected_start_index=self.selection.start_index,
-                selected_end_index=self.selection.end_index,
-                colors=self.view.chart_colors,
-                line_zoom=float(self.view.line_zoom_var.get()),
-                digits_1=snapshot.digits_1,
-                digits_2=snapshot.digits_2,
-                mutual_exclusion_enabled=bool(self.view.mutual_exclusion_var.get()),
-                signal_diagnostics=snapshot.signal_diagnostics,
-                line_chart_mode=self.view.line_chart_mode_var.get().strip() or "gap_ma",
-            )
-
-            self.view.update_idletasks()
-            self.sync_canvas_view(prev_x if had_snapshot else 1.0)
-            self.view.status_var.set("rendered")
-            self.update_trade_hint()
-            self.update_selection_stats()
-            self.schedule_state_save()
+            self._apply_live_tail_only(preview_snapshot, from_live)
         except Exception as exc:
-            self.view.status_var.set("render_error")
-            messagebox.showerror("Рендер", str(exc))
+            self.view.status_var.set("live_error" if from_live else "render_error")
+            if not from_live:
+                messagebox.showerror("Рендер", str(exc))
 
     def redraw_current_snapshot(self) -> None:
-        if self.current_snapshot is None or self.current_snapshot.bars.empty:
+        if self.current_snapshot is None or (self.current_snapshot.bars.empty and self.current_snapshot.live_tail is None):
             return
-        prev_x = self.view.candle_canvas.xview()[0]
+
+        prev_left, prev_right = self.view.candle_canvas.xview()
         self.selection.resolve_indices(self.current_snapshot.bars)
 
         self.chart.draw(
@@ -2924,14 +3452,29 @@ class ControllerRenderMixin:
             digits_1=self.current_snapshot.digits_1,
             digits_2=self.current_snapshot.digits_2,
             mutual_exclusion_enabled=bool(self.view.mutual_exclusion_var.get()),
-            signal_diagnostics=self.current_snapshot.signal_diagnostics,
-            line_chart_mode=self.view.line_chart_mode_var.get().strip() or "gap_ma",
+            range_stats=self.current_snapshot.range_stats,
+            flow_diagnostics=self.current_snapshot.flow_diagnostics,
+            live_tail=self.current_snapshot.live_tail,
         )
 
         self.view.update_idletasks()
-        self.sync_canvas_view(prev_x)
+        self._restore_scroll_after_redraw(prev_left, prev_right, had_snapshot=True)
         self.update_trade_hint()
         self.update_selection_stats()
+
+    def update_range_stats(self) -> None:
+        if self.current_snapshot is None:
+            self.view.range_long_var.set("-")
+            self.view.range_short_var.set("-")
+            self.view.range_common_var.set("-")
+            return
+
+        stats = self.current_snapshot.range_stats
+        s1 = self.view.symbol_1_var.get().strip() or "PAIR1"
+        s2 = self.view.symbol_2_var.get().strip() or "PAIR2"
+        self.view.range_long_var.set(f"LONG:  {s1}: {stats.symbol_1_long_total:.1f} |{stats.long_ratio:.3f}| {stats.symbol_2_long_total:.1f} :{s2}")
+        self.view.range_short_var.set(f"SHORT: {s1}: {stats.symbol_1_short_total:.1f} |{stats.short_ratio:.3f}| {stats.symbol_2_short_total:.1f} :{s2}")
+        self.view.range_common_var.set(f"common: {stats.common_ratio:.3f}")
 
     def update_trade_hint(self) -> None:
         snapshot = self.current_snapshot
@@ -2939,45 +3482,27 @@ class ControllerRenderMixin:
             self.view.trade_hint_var.set("-")
             return
 
-        mode_text = "AUTO" if self.view.auto_volume_var.get() else "MANUAL"
+        active_flow = snapshot.live_tail.flow_diagnostics if snapshot.live_tail is not None else snapshot.flow_diagnostics
+        active_plan = snapshot.live_tail.trade_plan if snapshot.live_tail is not None else snapshot.trade_plan
+
         try:
-            lot_1, lot_2 = self.resolve_pair_lots(strict=not self.view.auto_volume_var.get())
-            hedge = snapshot.hedge_diagnostics
-            signal = snapshot.signal_diagnostics
-            state_text = "ENTER" if signal.entry_ready else ("EXIT" if signal.exit_ready else "WAIT")
-            if snapshot.trade_plan.entry_ready:
-                legs_text = (
-                    f"{snapshot.trade_plan.symbol_1_side.upper()} {snapshot.trade_plan.symbol_1} {lot_1:.2f} | "
-                    f"{snapshot.trade_plan.symbol_2_side.upper()} {snapshot.trade_plan.symbol_2} {lot_2:.2f}"
-                )
-            else:
-                legs_text = "входа нет"
+            lots = self.resolve_pair_lots(active_plan.symbol_1_side)
             self.view.trade_hint_var.set(
-                f"{mode_text} | {state_text} | gap={signal.gap_last:+.2f} | "
-                f"fast={signal.fast_last:+.2f} slow={signal.slow_last:+.2f} | "
-                f"diff={signal.ma_diff_last:+.2f} | entry={signal.entry_threshold:.2f} exit={signal.exit_threshold:.2f} | "
-                f"q={hedge.execution_ratio:+.4f} relation={hedge.side_relation} | {legs_text}"
+                f"line1={active_flow.line_1_last:+.2f} | line2={active_flow.line_2_last:+.2f} | diff={active_flow.diff_last:+.2f} | "
+                f"relation={snapshot.hedge_diagnostics.side_relation} | lots={lots[0]:.2f}/{lots[1]:.2f}"
             )
         except Exception as exc:
-            self.view.trade_hint_var.set(f"{mode_text} | ошибка параметров: {exc}")
-
-    def on_toggle_negative_correlation(self) -> None:
-        self.schedule_state_save()
-        if self.current_snapshot is not None:
-            self.render_once()
+            self.view.trade_hint_var.set(f"ошибка параметров: {exc}")
 
     def on_toggle_mutual_exclusion(self) -> None:
         self.schedule_state_save()
         if self.current_snapshot is not None:
-            self.redraw_current_snapshot()
-
-    def on_toggle_auto_volume(self) -> None:
-        self.update_manual_volume_state()
-        self.schedule_state_save()
-        self.update_trade_hint()
+            self.render_once()
 
 # src/app/ui_relative_compare/ui/controller/selection.py
 from __future__ import annotations
+
+import pandas as pd
 
 from src.app.ui_relative_compare.services.market.transform import transform_price_delta_to_pips
 from .helpers import format_pips, format_symbol_for_stats
@@ -3016,7 +3541,6 @@ class ControllerSelectionMixin:
             if delta == 0:
                 return "break"
             delta_units = -3 if delta > 0 else 3
-
         self.view.candle_canvas.xview_scroll(delta_units, "units")
         self.view.line_canvas.xview_scroll(delta_units, "units")
         return "break"
@@ -3046,16 +3570,27 @@ class ControllerSelectionMixin:
             return
         canvas = self.view.candle_canvas if widget is self.view.candle_canvas else self.view.line_canvas
         x_world = float(canvas.canvasx(x_local))
-        index = self.chart.get_index_at_x(
-            bars_count=len(self.current_snapshot.bars),
-            x_world=x_world,
-            width_adjust_px=self.view.width_adjust_px,
-            pair_gap_adjust_px=self.view.pair_gap_adjust_px,
-        )
+        index = self.chart.get_index_at_x(len(self.current_snapshot.bars), x_world, self.view.width_adjust_px, self.view.pair_gap_adjust_px)
         if index is None:
             return
         self.selection.register_click(self.current_snapshot.bars, index)
         self.redraw_current_snapshot()
+
+    def _format_range_start_end(self, start_ts, end_ts, candles_distance: int) -> str:
+        start = pd.Timestamp(start_ts)
+        end = pd.Timestamp(end_ts)
+        same_year = start.year == end.year
+        same_day = start.normalize() == end.normalize()
+        if same_day:
+            start_text = start.strftime("%H:%M:%S")
+            end_text = end.strftime("%H:%M:%S")
+        elif same_year:
+            start_text = start.strftime("%d.%m %H:%M:%S")
+            end_text = end.strftime("%d.%m %H:%M:%S")
+        else:
+            start_text = start.strftime("%d.%m.%Y %H:%M:%S")
+            end_text = end.strftime("%d.%m.%Y %H:%M:%S")
+        return f"{start_text} ->\n{end_text} ({candles_distance} свечей)"
 
     def update_selection_stats(self) -> None:
         if self.current_snapshot is None or self.current_snapshot.bars.empty:
@@ -3079,33 +3614,21 @@ class ControllerSelectionMixin:
         end_row = bars.iloc[end_index]
 
         if self.selection.end_index is None:
-            self.view.selection_range_var.set(f"START: {start_row['time']} | жду END")
+            self.view.selection_range_var.set(f"START: {pd.Timestamp(start_row['time']).strftime('%H:%M:%S')} ->\nжду END")
             self.view.selection_pair_1_var.set("-")
             self.view.selection_pair_2_var.set("-")
             self.view.selection_diff_var.set("-")
             return
 
-        move_1_pips = float(
-            transform_price_delta_to_pips(
-                float(end_row["close_1"]) - float(start_row["close_1"]),
-                self.current_snapshot.digits_1,
-            )
-        )
-        move_2_pips = float(
-            transform_price_delta_to_pips(
-                float(end_row["close_2"]) - float(start_row["close_2"]),
-                self.current_snapshot.digits_2,
-                self.current_snapshot.ratio_1_to_2,
-                self.current_snapshot.negative_correlation,
-            )
-        )
+        move_1_pips = float(transform_price_delta_to_pips(float(end_row["close_1"]) - float(start_row["close_1"]), self.current_snapshot.digits_1))
+        move_2_pips = float(transform_price_delta_to_pips(float(end_row["close_2"]) - float(start_row["close_2"]), self.current_snapshot.digits_2, 1.0, self.current_snapshot.negative_correlation))
         diff_pips = move_1_pips - move_2_pips
         candles_distance = max(0, end_index - start_index)
 
-        self.view.selection_range_var.set(f"{start_row['time']} -> {end_row['time']} | свечей между точками: {candles_distance}")
-        self.view.selection_pair_1_var.set(f"{format_symbol_for_stats(self.view.symbol_1_var.get().strip())}: {format_pips(move_1_pips)} pip")
-        self.view.selection_pair_2_var.set(f"{format_symbol_for_stats(self.view.symbol_2_var.get().strip())}: {format_pips(move_2_pips)} pip")
-        self.view.selection_diff_var.set(f"diff: {format_pips(diff_pips)} pip")
+        self.view.selection_range_var.set(self._format_range_start_end(start_row["time"], end_row["time"], candles_distance))
+        self.view.selection_pair_1_var.set(f"{format_symbol_for_stats(self.view.symbol_1_var.get().strip())}: {format_pips(move_1_pips)}")
+        self.view.selection_pair_2_var.set(f"{format_symbol_for_stats(self.view.symbol_2_var.get().strip())}: {format_pips(move_2_pips)}")
+        self.view.selection_diff_var.set(f"diff: {format_pips(diff_pips)}")
 
 # src/app/ui_relative_compare/ui/controller/state.py
 from __future__ import annotations
@@ -3126,17 +3649,15 @@ class ControllerStateMixin:
             self.view.visible_bars_var,
             self.view.refresh_ms_var,
             self.view.aggregate_bars_var,
-            self.view.manual_ratio_1_to_2_var,
-            self.view.negative_correlation_var,
+            self.view.base_trading_lot_var,
+            self.view.cost_coeff_1_var,
+            self.view.cost_coeff_2_var,
+            self.view.cost_coeff_1_enabled_var,
+            self.view.cost_coeff_2_enabled_var,
             self.view.mutual_exclusion_var,
-            self.view.auto_volume_var,
-            self.view.manual_lot_1_var,
-            self.view.manual_lot_2_var,
-            self.view.signal_fast_ma_var,
-            self.view.signal_slow_ma_var,
-            self.view.signal_entry_threshold_var,
-            self.view.signal_exit_threshold_var,
-            self.view.line_chart_mode_var,
+            self.view.apply_long_ratio_var,
+            self.view.apply_short_ratio_var,
+            self.view.apply_common_ratio_var,
             self.view.line_zoom_var,
         ]
         for var in tracked:
@@ -3144,14 +3665,9 @@ class ControllerStateMixin:
 
         self.view.symbol_1_var.trace_add("write", self.on_symbols_changed)
         self.view.symbol_2_var.trace_add("write", self.on_symbols_changed)
-        self.view.manual_lot_1_var.trace_add("write", self.on_manual_volume_changed)
-        self.view.manual_lot_2_var.trace_add("write", self.on_manual_volume_changed)
-        self.view.manual_ratio_1_to_2_var.trace_add("write", self.on_manual_ratio_changed)
-        self.view.signal_fast_ma_var.trace_add("write", self.on_signal_param_changed)
-        self.view.signal_slow_ma_var.trace_add("write", self.on_signal_param_changed)
-        self.view.signal_entry_threshold_var.trace_add("write", self.on_signal_param_changed)
-        self.view.signal_exit_threshold_var.trace_add("write", self.on_signal_param_changed)
-
+        self.view.base_trading_lot_var.trace_add("write", self.on_lot_inputs_changed)
+        self.view.cost_coeff_1_var.trace_add("write", self.on_lot_inputs_changed)
+        self.view.cost_coeff_2_var.trace_add("write", self.on_lot_inputs_changed)
         self.view.bind("<Configure>", self.on_window_configure)
         self.view.chart_panes.bind("<ButtonRelease-1>", self.on_chart_panes_release)
 
@@ -3179,26 +3695,25 @@ class ControllerStateMixin:
     def collect_ui_state(self) -> UIState:
         return UIState(
             symbol_1=self.view.symbol_1_var.get().strip() or "EURUSD",
-            symbol_2=self.view.symbol_2_var.get().strip() or "AUDUSD",
+            symbol_2=self.view.symbol_2_var.get().strip() or "USDCHF",
             timeframe=self.view.timeframe_var.get().strip() or "M1",
-            visible_bars=self.view.visible_bars_var.get().strip() or "120",
+            visible_bars=self.view.visible_bars_var.get().strip() or "1200",
             refresh_ms=self.view.refresh_ms_var.get().strip() or "250",
             aggregate_bars=self.view.aggregate_bars_var.get().strip() or "1",
-            manual_ratio_1_to_2=self.view.manual_ratio_1_to_2_var.get().strip() or "1.000000",
-            negative_correlation=bool(self.view.negative_correlation_var.get()),
+            base_trading_lot=self.view.base_trading_lot_var.get().strip() or "0.10",
+            cost_coeff_1=self.view.cost_coeff_1_var.get().strip() or "1.00",
+            cost_coeff_2=self.view.cost_coeff_2_var.get().strip() or "1.00",
+            cost_coeff_1_enabled=bool(self.view.cost_coeff_1_enabled_var.get()),
+            cost_coeff_2_enabled=bool(self.view.cost_coeff_2_enabled_var.get()),
             mutual_exclusion_enabled=bool(self.view.mutual_exclusion_var.get()),
-            auto_volume=bool(self.view.auto_volume_var.get()),
-            manual_lot_1=self.view.manual_lot_1_var.get().strip() or "0.10",
-            manual_lot_2=self.view.manual_lot_2_var.get().strip() or "0.10",
-            signal_fast_ma=self.view.signal_fast_ma_var.get().strip() or "8",
-            signal_slow_ma=self.view.signal_slow_ma_var.get().strip() or "34",
-            signal_entry_threshold=self.view.signal_entry_threshold_var.get().strip() or "12.0",
-            signal_exit_threshold=self.view.signal_exit_threshold_var.get().strip() or "3.0",
-            line_chart_mode=self.view.line_chart_mode_var.get().strip() or "gap_ma",
+            apply_long_ratio=bool(self.view.apply_long_ratio_var.get()),
+            apply_short_ratio=bool(self.view.apply_short_ratio_var.get()),
+            apply_common_ratio=bool(self.view.apply_common_ratio_var.get()),
             width_adjust_px=int(self.view.width_adjust_px),
             height_adjust_px=int(self.view.height_adjust_px),
             pair_gap_adjust_px=int(self.view.pair_gap_adjust_px),
             chart_split_y=int(self.view.chart_split_y if (self.view.candle_collapsed or self.view.line_collapsed) else self.view.current_chart_split_y()),
+            sizing_collapsed=bool(self.view.sizing_collapsed),
             candle_collapsed=bool(self.view.candle_collapsed),
             line_collapsed=bool(self.view.line_collapsed),
             pair_1_up_color=self.view.chart_colors["pair_1_up"],
@@ -3245,9 +3760,9 @@ class ControllerStateMixin:
 
     def update_symbol_labels(self) -> None:
         symbol_1 = self.view.symbol_1_var.get().strip() or "EURUSD"
-        symbol_2 = self.view.symbol_2_var.get().strip() or "AUDUSD"
-        self.view.manual_lot_1_label_var.set(f"Lot {normalize_symbol(symbol_1)}")
-        self.view.manual_lot_2_label_var.set(f"Lot {normalize_symbol(symbol_2)}")
+        symbol_2 = self.view.symbol_2_var.get().strip() or "USDCHF"
+        self.view.manual_lot_1_label_var.set(f"Итог {normalize_symbol(symbol_1)}")
+        self.view.manual_lot_2_label_var.set(f"Итог {normalize_symbol(symbol_2)}")
         self.view.header_symbol_1_var.set(base_label(symbol_1))
         self.view.header_symbol_2_var.set(base_label(symbol_2))
         self.view.action_pair_1_var.set(normalize_symbol(symbol_1))
@@ -3255,77 +3770,79 @@ class ControllerStateMixin:
 
     def on_symbols_changed(self, *_args) -> None:
         self.update_symbol_labels()
+        self.update_final_lots_preview()
         self.schedule_state_save()
 
-    def on_manual_volume_changed(self, *_args) -> None:
-        if not self.view.auto_volume_var.get():
-            self.update_trade_hint()
-
-    def on_manual_ratio_changed(self, *_args) -> None:
+    def on_lot_inputs_changed(self, *_args) -> None:
+        self.update_final_lots_preview()
         self.update_trade_hint()
 
-    def on_signal_param_changed(self, *_args) -> None:
-        self.update_trade_hint()
+    def update_final_lots_preview(self) -> None:
+        try:
+            lot_1, lot_2 = self.resolve_pair_lots()
+            self.view.final_lot_1_var.set(f"{lot_1:.2f}")
+            self.view.final_lot_2_var.set(f"{lot_2:.2f}")
+        except Exception:
+            self.view.final_lot_1_var.set("-")
+            self.view.final_lot_2_var.set("-")
 
-    def on_line_chart_mode_changed(self) -> None:
+    def on_ratio_checkbox_changed(self) -> None:
+        if self.view.apply_common_ratio_var.get():
+            self.view.apply_long_ratio_var.set(False)
+            self.view.apply_short_ratio_var.set(False)
+        elif self.view.apply_long_ratio_var.get() or self.view.apply_short_ratio_var.get():
+            self.view.apply_common_ratio_var.set(False)
         if self.current_snapshot is not None:
-            self.redraw_current_snapshot()
+            self.render_once()
 
+    def on_cost_coeff_changed(self) -> None:
+        self.update_final_lots_preview()
+        if self.current_snapshot is not None:
+            self.render_once()
     def update_manual_volume_state(self) -> None:
-        state = "disabled" if self.view.auto_volume_var.get() else "normal"
-        self.view.manual_lot_1_entry.configure(state=state)
-        self.view.manual_lot_2_entry.configure(state=state)
+        self.update_final_lots_preview()
 
 # src/app/ui_relative_compare/ui/controller/trade.py
 from __future__ import annotations
 
 from tkinter import messagebox
 
-from src.app.ui_relative_compare.services.market.hedge.direction import paired_side
 from src.app.ui_relative_compare.services.trading import close_pair_positions, open_pair_legs, reverse_pair_positions
 
 
 class ControllerTradeMixin:
     def _current_side_relation(self) -> str:
-        if self.current_snapshot is not None:
-            return self.current_snapshot.trade_plan.side_relation
-        return "same" if bool(self.view.negative_correlation_var.get()) else "opposite"
+        if self.current_snapshot is None:
+            raise RuntimeError("Сначала сделай рендер, чтобы получить автоматическую связь пар")
+        return self.current_snapshot.trade_plan.side_relation
 
     def build_direct_order(self, symbol_index: int, side: str) -> list[tuple[str, str, float]]:
+        if self.current_snapshot is None:
+            raise RuntimeError("Сначала сделай рендер, чтобы посчитать лоты и связь пар")
+
         symbol_1, symbol_2, _, _, _, _ = self.read_inputs()
-        lot_1, lot_2 = self.resolve_pair_lots(strict=True)
         side_relation = self._current_side_relation()
 
         if symbol_index == 1:
             side_1 = side
-            side_2 = paired_side(side, side_relation)
+            side_2 = side if side_relation == "same" else ("buy" if side == "sell" else "sell")
         elif symbol_index == 2:
             side_2 = side
-            side_1 = paired_side(side, side_relation)
+            side_1 = side if side_relation == "same" else ("buy" if side == "sell" else "sell")
         else:
             raise RuntimeError("Некорректная команда открытия")
 
-        return [
-            (symbol_1, side_1, lot_1),
-            (symbol_2, side_2, lot_2),
-        ]
+        lot_1, lot_2 = self.resolve_pair_lots(side_1)
+        return [(symbol_1, side_1, lot_1), (symbol_2, side_2, lot_2)]
 
     def open_direct_order(self, symbol_index: int, side: str) -> None:
         try:
             self.ensure_connected()
             assert self.client is not None
-
             legs = self.build_direct_order(symbol_index, side)
-            result = open_pair_legs(
-                client=self.client,
-                cfg=self.base_cfg,
-                legs=legs,
-            )
+            result = open_pair_legs(client=self.client, cfg=self.base_cfg, legs=legs)
             self.view.status_var.set("orders_opened")
-            opened_text = "\n".join(
-                f"{leg.side.upper()} {leg.symbol} {leg.volume:.2f} order={leg.order} retcode={leg.retcode}"
-                for leg in result.legs
-            )
+            opened_text = "\n".join(f"{leg.side.upper()} {leg.symbol} {leg.volume:.2f} order={leg.order} retcode={leg.retcode}" for leg in result.legs)
             messagebox.showinfo("Позиции открыты", opened_text)
             if self.current_snapshot is not None:
                 self.render_once()
@@ -3340,17 +3857,7 @@ class ControllerTradeMixin:
             symbol_1, symbol_2, _, _, _, _ = self.read_inputs()
             summary = close_pair_positions(self.client, self.base_cfg, symbol_1, symbol_2)
             self.view.status_var.set("positions_closed")
-            messagebox.showinfo(
-                "Позиции закрыты",
-                f"Связка: {symbol_1} / {symbol_2}\n"
-                f"Закрыто позиций: {summary.closed_count}\n"
-                f"Сделок MT: {summary.deals_count}\n"
-                f"MT profit: {summary.profit_usd:.2f}\n"
-                f"MT commission: {summary.commission_usd:.2f}\n"
-                f"MT swap: {summary.swap_usd:.2f}\n"
-                f"MT fee: {summary.fee_usd:.2f}\n"
-                f"MT total pnl: {summary.total_pnl_usd:.2f}",
-            )
+            messagebox.showinfo("Позиции закрыты", f"Связка: {symbol_1} / {symbol_2}\nЗакрыто позиций: {summary.closed_count}\nСделок MT: {summary.deals_count}\nMT total pnl: {summary.total_pnl_usd:.2f}")
             if self.current_snapshot is not None:
                 self.render_once()
         except Exception as exc:
@@ -3364,18 +3871,8 @@ class ControllerTradeMixin:
             symbol_1, symbol_2, _, _, _, _ = self.read_inputs()
             summary = reverse_pair_positions(self.client, self.base_cfg, symbol_1, symbol_2)
             self.view.status_var.set("positions_reversed")
-            reopened_lines = [
-                f"{leg.side.upper()} {leg.symbol} {leg.volume:.2f} order={leg.order} retcode={leg.retcode}"
-                for leg in summary.reopened_legs
-            ]
-            messagebox.showinfo(
-                "Позиции развернуты",
-                f"Связка: {symbol_1} / {symbol_2}\n"
-                f"Закрыто позиций: {summary.close_summary.closed_count}\n"
-                f"Сделок MT: {summary.close_summary.deals_count}\n"
-                f"MT total pnl: {summary.close_summary.total_pnl_usd:.2f}\n\n"
-                f"Открыто в обратную сторону:\n" + "\n".join(reopened_lines),
-            )
+            reopened_lines = [f"{leg.side.upper()} {leg.symbol} {leg.volume:.2f} order={leg.order} retcode={leg.retcode}" for leg in summary.reopened_legs]
+            messagebox.showinfo("Позиции развернуты", f"Связка: {symbol_1} / {symbol_2}\nMT total pnl: {summary.close_summary.total_pnl_usd:.2f}\n\n" + "\n".join(reopened_lines))
             if self.current_snapshot is not None:
                 self.render_once()
         except Exception as exc:
@@ -3490,7 +3987,7 @@ def build_panes(window, parent) -> None:
     window.candle_canvas = tk.Canvas(window.candle_body, bg=ACTION_BG, highlightthickness=0)
     window.candle_canvas.pack(fill="both", expand=True)
 
-    window.line_header = window.make_chart_panel_header(window.line_wrap, title="Средние скользящие", indicator_var=window.line_toggle_var, command=window.controller.toggle_line_panel)
+    window.line_header = window.make_chart_panel_header(window.line_wrap, title="Расхождение ходов", indicator_var=window.line_toggle_var, command=window.controller.toggle_line_panel)
     window.line_header.pack(fill="x", side="top")
     window.line_body = tk.Frame(window.line_wrap, bg=ACTION_BG, highlightthickness=0, bd=0)
     window.line_body.pack(fill="both", expand=True)
@@ -3545,13 +4042,7 @@ def build_controls(window, parent) -> None:
     window.symbol_2_box.grid(row=0, column=3, padx=(6, 14), sticky="w")
 
     ttk.Label(controls, text="Timeframe").grid(row=0, column=4, sticky="w")
-    ttk.Combobox(
-        controls,
-        textvariable=window.timeframe_var,
-        values=list(TIMEFRAME_MINUTES.keys()),
-        state="readonly",
-        width=8,
-    ).grid(row=0, column=5, padx=(6, 14), sticky="w")
+    ttk.Combobox(controls, textvariable=window.timeframe_var, values=list(TIMEFRAME_MINUTES.keys()), state="readonly", width=8).grid(row=0, column=5, padx=(6, 14), sticky="w")
 
     ttk.Label(controls, text="Баров в ленте").grid(row=0, column=6, sticky="w")
     ttk.Entry(controls, textvariable=window.visible_bars_var, width=8).grid(row=0, column=7, padx=(6, 14), sticky="w")
@@ -3559,63 +4050,34 @@ def build_controls(window, parent) -> None:
     ttk.Label(controls, text="Refresh ms").grid(row=0, column=8, sticky="w")
     ttk.Entry(controls, textvariable=window.refresh_ms_var, width=8).grid(row=0, column=9, padx=(6, 14), sticky="w")
 
-    ttk.Label(controls, text="Коэф 1/2").grid(row=0, column=10, sticky="w")
-    ttk.Entry(controls, textvariable=window.manual_ratio_1_to_2_var, width=10).grid(row=0, column=11, padx=(6, 14), sticky="w")
+    ttk.Label(controls, text="Базовый торговый лот").grid(row=1, column=0, sticky="w", pady=(10, 0))
+    ttk.Entry(controls, textvariable=window.base_trading_lot_var, width=8).grid(row=1, column=1, padx=(6, 14), pady=(10, 0), sticky="w")
 
-    ttk.Label(controls, text="Fast MA").grid(row=1, column=0, sticky="w", pady=(10, 0))
-    ttk.Entry(controls, textvariable=window.signal_fast_ma_var, width=8).grid(row=1, column=1, padx=(6, 14), pady=(10, 0), sticky="w")
+    ttk.Label(controls, text="Баров в 1 свече").grid(row=1, column=2, sticky="w", pady=(10, 0))
+    ttk.Entry(controls, textvariable=window.aggregate_bars_var, width=8).grid(row=1, column=3, padx=(6, 14), pady=(10, 0), sticky="w")
 
-    ttk.Label(controls, text="Slow MA").grid(row=1, column=2, sticky="w", pady=(10, 0))
-    ttk.Entry(controls, textvariable=window.signal_slow_ma_var, width=8).grid(row=1, column=3, padx=(6, 14), pady=(10, 0), sticky="w")
+    coeff = ttk.LabelFrame(controls, text="Коэффициент стоимости", padding=8)
+    coeff.grid(row=1, column=4, columnspan=6, rowspan=2, sticky="w", padx=(0, 14), pady=(10, 0))
 
-    ttk.Label(controls, text="Порог входа").grid(row=1, column=4, sticky="w", pady=(10, 0))
-    ttk.Entry(controls, textvariable=window.signal_entry_threshold_var, width=8).grid(row=1, column=5, padx=(6, 14), pady=(10, 0), sticky="w")
+    ttk.Checkbutton(coeff, variable=window.cost_coeff_1_enabled_var, command=window.controller.on_cost_coeff_changed).grid(row=0, column=0, sticky="w")
+    ttk.Label(coeff, textvariable=window.action_pair_1_var).grid(row=0, column=1, sticky="w", padx=(2, 6))
+    ttk.Entry(coeff, textvariable=window.cost_coeff_1_var, width=8).grid(row=0, column=2, sticky="w", padx=(0, 14))
 
-    ttk.Label(controls, text="Порог выхода").grid(row=1, column=6, sticky="w", pady=(10, 0))
-    ttk.Entry(controls, textvariable=window.signal_exit_threshold_var, width=8).grid(row=1, column=7, padx=(6, 14), pady=(10, 0), sticky="w")
+    ttk.Checkbutton(coeff, variable=window.cost_coeff_2_enabled_var, command=window.controller.on_cost_coeff_changed).grid(row=0, column=3, sticky="w")
+    ttk.Label(coeff, textvariable=window.action_pair_2_var).grid(row=0, column=4, sticky="w", padx=(2, 6))
+    ttk.Entry(coeff, textvariable=window.cost_coeff_2_var, width=8).grid(row=0, column=5, sticky="w")
 
-    ttk.Checkbutton(
-        controls,
-        text="Нижний график: gap + diff(fast-slow)",
-        variable=window.line_chart_mode_var,
-        onvalue="gap_diff",
-        offvalue="gap_ma",
-        command=window.controller.on_line_chart_mode_changed,
-    ).grid(row=1, column=8, columnspan=4, padx=(6, 14), pady=(10, 0), sticky="w")
+    ttk.Label(controls, textvariable=window.manual_lot_1_label_var).grid(row=2, column=0, pady=(10, 0), sticky="w")
+    ttk.Label(controls, textvariable=window.final_lot_1_var).grid(row=2, column=1, pady=(10, 0), sticky="w")
+    ttk.Label(controls, textvariable=window.manual_lot_2_label_var).grid(row=2, column=2, pady=(10, 0), sticky="w")
+    ttk.Label(controls, textvariable=window.final_lot_2_var).grid(row=2, column=3, pady=(10, 0), sticky="w")
 
-    ttk.Checkbutton(
-        controls,
-        text="Отрицательная корреляция",
-        variable=window.negative_correlation_var,
-        command=window.controller.on_toggle_negative_correlation,
-    ).grid(row=2, column=0, columnspan=2, pady=(10, 0), sticky="w")
+    ttk.Checkbutton(controls, text="Взаимоисключение движения", variable=window.mutual_exclusion_var, command=window.controller.on_toggle_mutual_exclusion).grid(row=2, column=10, columnspan=2, pady=(10, 0), sticky="w")
 
-    ttk.Checkbutton(
-        controls,
-        text="Взаимоисключение движения",
-        variable=window.mutual_exclusion_var,
-        command=window.controller.on_toggle_mutual_exclusion,
-    ).grid(row=2, column=2, columnspan=2, pady=(10, 0), sticky="w")
-
-    ttk.Checkbutton(
-        controls,
-        text="Объем автоматически",
-        variable=window.auto_volume_var,
-        command=window.controller.on_toggle_auto_volume,
-    ).grid(row=2, column=4, columnspan=2, pady=(10, 0), sticky="w")
-
-    ttk.Label(controls, textvariable=window.manual_lot_1_label_var).grid(row=2, column=6, pady=(10, 0), sticky="w")
-    window.manual_lot_1_entry = ttk.Entry(controls, textvariable=window.manual_lot_1_var, width=8)
-    window.manual_lot_1_entry.grid(row=2, column=7, padx=(6, 14), pady=(10, 0), sticky="w")
-
-    ttk.Label(controls, textvariable=window.manual_lot_2_label_var).grid(row=2, column=8, pady=(10, 0), sticky="w")
-    window.manual_lot_2_entry = ttk.Entry(controls, textvariable=window.manual_lot_2_var, width=8)
-    window.manual_lot_2_entry.grid(row=2, column=9, padx=(6, 14), pady=(10, 0), sticky="w")
-
-    ttk.Button(controls, text="Подключить MT5", command=window.controller.connect_mt5).grid(row=2, column=10, pady=(10, 0), sticky="w")
-    ttk.Button(controls, text="Старт", command=window.controller.start_live).grid(row=2, column=11, pady=(10, 0), sticky="w")
-    ttk.Button(controls, text="Стоп", command=window.controller.stop_live).grid(row=2, column=12, pady=(10, 0), sticky="w")
-    ttk.Button(controls, text="Разовый рендер", command=window.controller.render_once).grid(row=2, column=13, pady=(10, 0), sticky="w")
+    ttk.Button(controls, text="Подключить MT5", command=window.controller.connect_mt5).grid(row=2, column=12, pady=(10, 0), sticky="w")
+    ttk.Button(controls, text="Старт", command=window.controller.start_live).grid(row=2, column=13, pady=(10, 0), sticky="w")
+    ttk.Button(controls, text="Стоп", command=window.controller.stop_live).grid(row=2, column=14, pady=(10, 0), sticky="w")
+    ttk.Button(controls, text="Разовый рендер", command=window.controller.render_once).grid(row=2, column=15, pady=(10, 0), sticky="w")
 
 # src/app/ui_relative_compare/ui/view/builders/info.py
 from __future__ import annotations
@@ -3626,44 +4088,59 @@ from .common import kv
 
 
 def build_info_blocks(window, parent) -> None:
-    sizing = ttk.LabelFrame(parent, text="Фиксированные размеры и отступы", padding=10)
-    sizing.pack(fill="x", pady=(10, 0))
+    sizing_wrap = ttk.LabelFrame(parent, text="Размеры и отступы", padding=8)
+    sizing_wrap.pack(fill="x", pady=(10, 0))
+    header = ttk.Frame(sizing_wrap)
+    header.pack(fill="x")
+    ttk.Button(header, textvariable=window.sizing_toggle_var, width=2, command=window.controller.toggle_sizing_panel).pack(side="left")
+    ttk.Label(header, text="Показать / скрыть").pack(side="left", padx=(6, 0))
 
-    ttk.Label(sizing, text="Ширина").grid(row=0, column=0, sticky="w")
-    ttk.Button(sizing, text="-1px", command=lambda: window.controller.change_size("width", -1)).grid(row=0, column=1, padx=(6, 4), sticky="w")
-    ttk.Button(sizing, text="+1px", command=lambda: window.controller.change_size("width", 1)).grid(row=0, column=2, padx=(0, 10), sticky="w")
-    ttk.Label(sizing, textvariable=window.width_size_var).grid(row=0, column=3, padx=(0, 18), sticky="w")
+    window.sizing_body = ttk.Frame(sizing_wrap)
+    window.sizing_body.pack(fill="x", pady=(8, 0))
 
-    ttk.Label(sizing, text="Высота").grid(row=0, column=4, sticky="w")
-    ttk.Button(sizing, text="-1px", command=lambda: window.controller.change_size("height", -1)).grid(row=0, column=5, padx=(6, 4), sticky="w")
-    ttk.Button(sizing, text="+1px", command=lambda: window.controller.change_size("height", 1)).grid(row=0, column=6, padx=(0, 10), sticky="w")
-    ttk.Label(sizing, textvariable=window.height_size_var).grid(row=0, column=7, padx=(0, 18), sticky="w")
+    ttk.Label(window.sizing_body, text="Ширина").grid(row=0, column=0, sticky="w")
+    ttk.Button(window.sizing_body, text="-1px", command=lambda: window.controller.change_size("width", -1)).grid(row=1, column=0, padx=(0, 4), sticky="w")
+    ttk.Button(window.sizing_body, text="+1px", command=lambda: window.controller.change_size("width", 1)).grid(row=1, column=1, padx=(0, 10), sticky="w")
+    ttk.Label(window.sizing_body, textvariable=window.width_size_var).grid(row=1, column=2, padx=(0, 18), sticky="w")
 
-    ttk.Label(sizing, text="Между парами").grid(row=0, column=8, sticky="w")
-    ttk.Button(sizing, text="-1px", command=lambda: window.controller.change_pair_gap(-1)).grid(row=0, column=9, padx=(6, 4), sticky="w")
-    ttk.Button(sizing, text="+1px", command=lambda: window.controller.change_pair_gap(1)).grid(row=0, column=10, padx=(0, 10), sticky="w")
-    ttk.Label(sizing, textvariable=window.pair_gap_size_var).grid(row=0, column=11, padx=(0, 18), sticky="w")
+    ttk.Label(window.sizing_body, text="Высота").grid(row=2, column=0, sticky="w", pady=(10, 0))
+    ttk.Button(window.sizing_body, text="-1px", command=lambda: window.controller.change_size("height", -1)).grid(row=3, column=0, padx=(0, 4), sticky="w")
+    ttk.Button(window.sizing_body, text="+1px", command=lambda: window.controller.change_size("height", 1)).grid(row=3, column=1, padx=(0, 10), sticky="w")
+    ttk.Label(window.sizing_body, textvariable=window.height_size_var).grid(row=3, column=2, padx=(0, 18), sticky="w")
 
-    ttk.Button(sizing, text="Сбросить", command=window.controller.reset_size).grid(row=0, column=12, sticky="w")
+    ttk.Label(window.sizing_body, text="Между парами").grid(row=4, column=0, sticky="w", pady=(10, 0))
+    ttk.Button(window.sizing_body, text="-1px", command=lambda: window.controller.change_pair_gap(-1)).grid(row=5, column=0, padx=(0, 4), sticky="w")
+    ttk.Button(window.sizing_body, text="+1px", command=lambda: window.controller.change_pair_gap(1)).grid(row=5, column=1, padx=(0, 10), sticky="w")
+    ttk.Label(window.sizing_body, textvariable=window.pair_gap_size_var).grid(row=5, column=2, padx=(0, 18), sticky="w")
+    ttk.Button(window.sizing_body, text="Сбросить", command=window.controller.reset_size).grid(row=5, column=3, sticky="w")
 
     info = ttk.LabelFrame(parent, text="Текущие параметры", padding=10)
     info.pack(fill="x", pady=(10, 0))
     kv(info, 0, 0, "Статус", window.status_var)
     kv(info, 0, 2, "Аккаунт", window.account_var)
     kv(info, 0, 4, "Последний бар", window.last_bar_time_var)
-    kv(info, 1, 0, "Коэф 1/2", window.manual_ratio_1_to_2_var)
-    kv(info, 1, 2, "Сборка", window.aggregate_info_var)
+    kv(info, 1, 0, "Сборка", window.aggregate_info_var)
+    kv(info, 1, 2, "Связь пар", window.auto_relation_var)
 
-    trade = ttk.LabelFrame(parent, text="Сигнал и объем", padding=10)
+    stats = ttk.LabelFrame(parent, text="Статистика диапазонов", padding=10)
+    stats.pack(fill="x", pady=(10, 0))
+    ttk.Checkbutton(stats, variable=window.apply_long_ratio_var, command=window.controller.on_ratio_checkbox_changed).grid(row=0, column=0, sticky="w")
+    ttk.Label(stats, textvariable=window.range_long_var).grid(row=0, column=1, sticky="w")
+    ttk.Checkbutton(stats, variable=window.apply_short_ratio_var, command=window.controller.on_ratio_checkbox_changed).grid(row=1, column=0, sticky="w")
+    ttk.Label(stats, textvariable=window.range_short_var).grid(row=1, column=1, sticky="w")
+    ttk.Checkbutton(stats, variable=window.apply_common_ratio_var, command=window.controller.on_ratio_checkbox_changed).grid(row=2, column=0, sticky="w")
+    ttk.Label(stats, textvariable=window.range_common_var).grid(row=2, column=1, sticky="w")
+
+    trade = ttk.LabelFrame(parent, text="Текущий перекос и лоты", padding=10)
     trade.pack(fill="x", pady=(10, 0))
     kv(trade, 0, 0, "Состояние", window.trade_hint_var)
 
     selection = ttk.LabelFrame(parent, text="Выбранный отрезок close-to-close", padding=10)
     selection.pack(fill="x", pady=(10, 0))
-    kv(selection, 0, 0, "Отрезок", window.selection_range_var)
-    kv(selection, 1, 0, "Пара 1", window.selection_pair_1_var)
-    kv(selection, 1, 2, "Пара 2", window.selection_pair_2_var)
-    kv(selection, 1, 4, "Diff", window.selection_diff_var)
+    ttk.Label(selection, textvariable=window.selection_range_var, justify="left").pack(anchor="w")
+    ttk.Label(selection, textvariable=window.selection_pair_1_var, justify="left").pack(anchor="w")
+    ttk.Label(selection, textvariable=window.selection_pair_2_var, justify="left").pack(anchor="w")
+    ttk.Label(selection, textvariable=window.selection_diff_var, justify="left").pack(anchor="w")
 
 # src/app/ui_relative_compare/ui/view/window.py
 from __future__ import annotations
@@ -3695,23 +4172,24 @@ class RelativeCompareWindow(tk.Tk):
         self.refresh_ms_var = tk.StringVar(value=saved_state.refresh_ms)
         self.aggregate_bars_var = tk.StringVar(value=saved_state.aggregate_bars)
         self.aggregate_info_var = tk.StringVar(value=f"{saved_state.timeframe} x {saved_state.aggregate_bars}")
-        self.manual_ratio_1_to_2_var = tk.StringVar(value=saved_state.manual_ratio_1_to_2)
-        self.negative_correlation_var = tk.BooleanVar(value=saved_state.negative_correlation)
+
+        self.base_trading_lot_var = tk.StringVar(value=saved_state.base_trading_lot)
+        self.cost_coeff_1_var = tk.StringVar(value=saved_state.cost_coeff_1)
+        self.cost_coeff_2_var = tk.StringVar(value=saved_state.cost_coeff_2)
+        self.cost_coeff_1_enabled_var = tk.BooleanVar(value=saved_state.cost_coeff_1_enabled)
+        self.cost_coeff_2_enabled_var = tk.BooleanVar(value=saved_state.cost_coeff_2_enabled)
         self.mutual_exclusion_var = tk.BooleanVar(value=saved_state.mutual_exclusion_enabled)
 
-        self.auto_volume_var = tk.BooleanVar(value=saved_state.auto_volume)
-        self.manual_lot_1_var = tk.StringVar(value=saved_state.manual_lot_1)
-        self.manual_lot_2_var = tk.StringVar(value=saved_state.manual_lot_2)
-        self.signal_fast_ma_var = tk.StringVar(value=saved_state.signal_fast_ma)
-        self.signal_slow_ma_var = tk.StringVar(value=saved_state.signal_slow_ma)
-        self.signal_entry_threshold_var = tk.StringVar(value=saved_state.signal_entry_threshold)
-        self.signal_exit_threshold_var = tk.StringVar(value=saved_state.signal_exit_threshold)
-        self.line_chart_mode_var = tk.StringVar(value=saved_state.line_chart_mode or "gap_ma")
+        self.apply_long_ratio_var = tk.BooleanVar(value=saved_state.apply_long_ratio)
+        self.apply_short_ratio_var = tk.BooleanVar(value=saved_state.apply_short_ratio)
+        self.apply_common_ratio_var = tk.BooleanVar(value=saved_state.apply_common_ratio)
 
-        self.manual_lot_1_label_var = tk.StringVar(value="Lot EURUSD")
-        self.manual_lot_2_label_var = tk.StringVar(value="Lot AUDUSD")
+        self.manual_lot_1_label_var = tk.StringVar(value="Итог EURUSD")
+        self.manual_lot_2_label_var = tk.StringVar(value="Итог USDCHF")
+        self.final_lot_1_var = tk.StringVar(value="0.00")
+        self.final_lot_2_var = tk.StringVar(value="0.00")
         self.header_symbol_1_var = tk.StringVar(value="EURO")
-        self.header_symbol_2_var = tk.StringVar(value="AUD")
+        self.header_symbol_2_var = tk.StringVar(value="USD")
         self.action_pair_1_var = tk.StringVar(value=saved_state.symbol_1)
         self.action_pair_2_var = tk.StringVar(value=saved_state.symbol_2)
 
@@ -3719,6 +4197,11 @@ class RelativeCompareWindow(tk.Tk):
         self.account_var = tk.StringVar(value="-")
         self.last_bar_time_var = tk.StringVar(value="-")
         self.trade_hint_var = tk.StringVar(value="-")
+        self.auto_relation_var = tk.StringVar(value="-")
+
+        self.range_long_var = tk.StringVar(value="-")
+        self.range_short_var = tk.StringVar(value="-")
+        self.range_common_var = tk.StringVar(value="-")
 
         self.selection_range_var = tk.StringVar(value="-")
         self.selection_pair_1_var = tk.StringVar(value="-")
@@ -3729,12 +4212,14 @@ class RelativeCompareWindow(tk.Tk):
         self.height_adjust_px = int(saved_state.height_adjust_px)
         self.pair_gap_adjust_px = int(saved_state.pair_gap_adjust_px)
         self.chart_split_y = int(saved_state.chart_split_y)
+        self.sizing_collapsed = bool(saved_state.sizing_collapsed)
         self.candle_collapsed = bool(saved_state.candle_collapsed)
         self.line_collapsed = bool(saved_state.line_collapsed)
 
         self.width_size_var = tk.StringVar(value=f"{self.width_adjust_px:+d}px")
         self.height_size_var = tk.StringVar(value=f"{self.height_adjust_px:+d}px")
         self.pair_gap_size_var = tk.StringVar(value=f"{self.pair_gap_adjust_px:+d}px")
+        self.sizing_toggle_var = tk.StringVar()
         self.candle_toggle_var = tk.StringVar()
         self.line_toggle_var = tk.StringVar()
         self.line_zoom_var = tk.DoubleVar(value=float(saved_state.line_zoom or 1.0))
@@ -3748,14 +4233,91 @@ class RelativeCompareWindow(tk.Tk):
         self.color_marker_widgets: dict[str, tk.Label] = {}
         self.action_button_widgets: dict[str, tk.Button] = {}
 
+        self.scroll_canvas: tk.Canvas | None = None
+        self.scroll_body: ttk.Frame | None = None
+        self.scroll_window_id: int | None = None
+        self.main_root_frame: ttk.Frame | None = None
+
         self.build_ui()
+        self._bind_global_scroll()
 
     def build_ui(self) -> None:
-        root = ttk.Frame(self, padding=12)
-        root.pack(fill="both", expand=True)
-        build_controls(self, root)
-        build_info_blocks(self, root)
-        build_chart_area(self, root)
+        shell = ttk.Frame(self)
+        shell.pack(fill="both", expand=True)
+
+        self.scroll_canvas = tk.Canvas(shell, highlightthickness=0, bd=0)
+        v_scroll = ttk.Scrollbar(shell, orient="vertical", command=self.scroll_canvas.yview)
+        self.scroll_canvas.configure(yscrollcommand=v_scroll.set)
+
+        self.scroll_canvas.pack(side="left", fill="both", expand=True)
+        v_scroll.pack(side="right", fill="y")
+
+        self.scroll_body = ttk.Frame(self.scroll_canvas)
+        self.scroll_window_id = self.scroll_canvas.create_window((0, 0), window=self.scroll_body, anchor="nw")
+
+        self.scroll_body.bind("<Configure>", self._on_scroll_body_configure)
+        self.scroll_canvas.bind("<Configure>", self._on_scroll_canvas_configure)
+
+        self.main_root_frame = ttk.Frame(self.scroll_body, padding=12)
+        self.main_root_frame.pack(fill="both", expand=True)
+
+        build_controls(self, self.main_root_frame)
+        build_info_blocks(self, self.main_root_frame)
+        build_chart_area(self, self.main_root_frame)
+
+        self.after_idle(self._refresh_global_scrollregion)
+
+    def _on_scroll_body_configure(self, _event) -> None:
+        self._refresh_global_scrollregion()
+
+    def _on_scroll_canvas_configure(self, event) -> None:
+        if self.scroll_canvas is None or self.scroll_window_id is None:
+            return
+        self.scroll_canvas.itemconfigure(self.scroll_window_id, width=max(1, int(event.width)))
+        self.after_idle(self._refresh_global_scrollregion)
+
+    def _refresh_global_scrollregion(self) -> None:
+        if self.scroll_canvas is None:
+            return
+        self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all"))
+
+    def _bind_global_scroll(self) -> None:
+        self.bind_all("<MouseWheel>", self._on_global_mousewheel, add="+")
+        self.bind_all("<Shift-MouseWheel>", self._on_global_mousewheel, add="+")
+        self.bind_all("<Button-4>", self._on_global_mousewheel, add="+")
+        self.bind_all("<Button-5>", self._on_global_mousewheel, add="+")
+
+    def _is_scroll_excluded_widget(self, widget) -> bool:
+        excluded = {
+            getattr(self, "candle_canvas", None),
+            getattr(self, "line_canvas", None),
+            getattr(self, "line_zoom_scale", None),
+        }
+        current = widget
+        while current is not None:
+            if current in excluded:
+                return True
+            current = getattr(current, "master", None)
+        return False
+
+    def _on_global_mousewheel(self, event) -> str | None:
+        if self.scroll_canvas is None:
+            return None
+        if self._is_scroll_excluded_widget(getattr(event, "widget", None)):
+            return None
+
+        if getattr(event, "num", None) == 4:
+            delta_units = -3
+        elif getattr(event, "num", None) == 5:
+            delta_units = 3
+        else:
+            delta = int(getattr(event, "delta", 0) or 0)
+            if delta == 0:
+                return None
+            delta_units = -3 if delta > 0 else 3
+
+        self.scroll_canvas.yview_scroll(delta_units, "units")
+        return "break"
 
     def make_action_label(self, parent: tk.Widget, text_var: tk.StringVar) -> tk.Label:
         return tk.Label(parent, textvariable=text_var, bg=ACTION_BG, fg=ACTION_TEXT, font=("Segoe UI", 10, "bold"), padx=0, pady=0)
@@ -3768,22 +4330,7 @@ class RelativeCompareWindow(tk.Tk):
     def make_action_button(self, parent: tk.Widget, text: str, command, bg_color: str, width_px: int, height_px: int = 28, store_key: str | None = None) -> tk.Frame:
         frame = tk.Frame(parent, width=width_px, height=height_px, bg=ACTION_BG, highlightthickness=0, bd=0)
         frame.pack_propagate(False)
-        button = tk.Button(
-            frame,
-            text=text,
-            command=command,
-            bg=bg_color,
-            fg="#ffffff",
-            activebackground=bg_color,
-            activeforeground="#ffffff",
-            highlightthickness=0,
-            relief="flat",
-            bd=0,
-            font=("Segoe UI", 8, "bold"),
-            cursor="hand2",
-            padx=0,
-            pady=0,
-        )
+        button = tk.Button(frame, text=text, command=command, bg=bg_color, fg="#ffffff", activebackground=bg_color, activeforeground="#ffffff", highlightthickness=0, relief="flat", bd=0, font=("Segoe UI", 8, "bold"), cursor="hand2", padx=0, pady=0)
         button.pack(fill="both", expand=True)
         if store_key:
             self.action_button_widgets[store_key] = button
@@ -3792,56 +4339,17 @@ class RelativeCompareWindow(tk.Tk):
     def make_chart_panel_header(self, parent: tk.Widget, title: str, indicator_var: tk.StringVar, command) -> tk.Frame:
         header = tk.Frame(parent, bg=PANE_HEADER_BG, height=32, highlightthickness=1, highlightbackground=PANE_BORDER, bd=0)
         header.pack_propagate(False)
-        toggle = tk.Button(
-            header,
-            textvariable=indicator_var,
-            command=command,
-            bg=PANE_HEADER_BG,
-            fg=ACTION_TEXT,
-            activebackground=PANE_HEADER_BG,
-            activeforeground="#ffffff",
-            highlightthickness=0,
-            relief="flat",
-            bd=0,
-            font=("Segoe UI", 10, "bold"),
-            width=2,
-            cursor="hand2",
-            padx=0,
-            pady=0,
-        )
+        toggle = tk.Button(header, textvariable=indicator_var, command=command, bg=PANE_HEADER_BG, fg=ACTION_TEXT, activebackground=PANE_HEADER_BG, activeforeground="#ffffff", highlightthickness=0, relief="flat", bd=0, font=("Segoe UI", 10, "bold"), width=2, cursor="hand2", padx=0, pady=0)
         toggle.pack(side="left", padx=(6, 4), pady=2)
         tk.Label(header, text=title, bg=PANE_HEADER_BG, fg=ACTION_TEXT, font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 6))
         return header
 
     def make_paned_window(self, parent: tk.Widget) -> tk.PanedWindow:
-        cfg_full = dict(
-            orient="vertical",
-            sashwidth=12,
-            sashpad=2,
-            bg=PANE_BORDER,
-            bd=0,
-            relief="flat",
-            opaqueresize=True,
-            sashrelief="raised",
-            sashcursor="sb_v_double_arrow",
-            showhandle=True,
-            handlesize=10,
-            handlepad=0,
-        )
+        cfg_full = dict(orient="vertical", sashwidth=12, sashpad=2, bg=PANE_BORDER, bd=0, relief="flat", opaqueresize=True, sashrelief="raised", sashcursor="sb_v_double_arrow", showhandle=True, handlesize=10, handlepad=0)
         try:
             return tk.PanedWindow(parent, **cfg_full)
         except tk.TclError:
-            cfg_safe = dict(
-                orient="vertical",
-                sashwidth=12,
-                sashpad=2,
-                bg=PANE_BORDER,
-                bd=0,
-                relief="flat",
-                opaqueresize=True,
-                sashrelief="raised",
-                sashcursor="sb_v_double_arrow",
-            )
+            cfg_safe = dict(orient="vertical", sashwidth=12, sashpad=2, bg=PANE_BORDER, bd=0, relief="flat", opaqueresize=True, sashrelief="raised", sashcursor="sb_v_double_arrow")
             return tk.PanedWindow(parent, **cfg_safe)
 
     def set_panel_body_visible(self, panel_body: tk.Frame, visible: bool) -> None:
@@ -3851,9 +4359,707 @@ class RelativeCompareWindow(tk.Tk):
                 panel_body.pack(fill="both", expand=True)
         elif manager == "pack":
             panel_body.pack_forget()
+        self.after_idle(self._refresh_global_scrollregion)
 
     def current_chart_split_y(self) -> int:
         try:
             return int(float(self.chart_panes.sash_coord(0)[1]))
         except Exception:
             return int(self.chart_split_y)
+
+# src/broker/__init__.py
+# src/broker/__init__.py
+# Broker adapters.
+
+# src/broker/mt5_client.py
+# src/broker/mt5_client.py
+# Thin MT5 wrapper for account, symbols, bars, and ticks.
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import MetaTrader5 as mt5
+import pandas as pd
+
+from src.common.settings import Settings
+
+
+TIMEFRAMES = {
+    "M1": mt5.TIMEFRAME_M1,
+    "M5": mt5.TIMEFRAME_M5,
+    "M15": mt5.TIMEFRAME_M15,
+    "H1": mt5.TIMEFRAME_H1,
+}
+
+
+@dataclass(slots=True)
+class SymbolMeta:
+    symbol: str
+    digits: int
+    point: float
+    contract_size: float
+    volume_min: float
+    volume_step: float
+    tick_size: float
+    tick_value: float
+    swap_long: float
+    swap_short: float
+
+
+class MT5Client:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    def _normalize_terminal_path(self) -> str | None:
+        raw = (self.settings.mt5_terminal_path or "").strip().strip('"').strip("'")
+        if not raw:
+            return None
+
+        path = Path(raw)
+
+        if path.is_dir():
+            for name in ("terminal64.exe", "terminal.exe", "metatrader64.exe", "metatrader.exe"):
+                candidate = path / name
+                if candidate.exists():
+                    return str(candidate)
+            raise RuntimeError(
+                f"MT5_TERMINAL_PATH points to a directory, but no terminal EXE was found inside: {path}"
+            )
+
+        if not path.exists():
+            raise RuntimeError(f"MT5 terminal path does not exist: {path}")
+
+        return str(path)
+
+    def connect(self) -> None:
+        terminal_path = self._normalize_terminal_path()
+
+        init_kwargs: dict[str, Any] = {
+            "timeout": self.settings.mt5_timeout_ms,
+            "portable": self.settings.mt5_portable,
+        }
+        if terminal_path:
+            init_kwargs["path"] = terminal_path
+
+        ok = mt5.initialize(**init_kwargs)
+        if not ok:
+            raise RuntimeError(f"mt5.initialize failed: {mt5.last_error()}")
+
+        if self.settings.mt5_login > 0:
+            ok = mt5.login(
+                int(self.settings.mt5_login),
+                password=self.settings.mt5_password,
+                server=self.settings.mt5_server,
+                timeout=self.settings.mt5_timeout_ms,
+            )
+            if not ok:
+                raise RuntimeError(f"mt5.login failed: {mt5.last_error()}")
+
+        account = mt5.account_info()
+        if account is None:
+            raise RuntimeError(f"mt5.account_info failed after login: {mt5.last_error()}")
+
+    def shutdown(self) -> None:
+        mt5.shutdown()
+
+    def ensure_symbol(self, symbol: str) -> None:
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            raise RuntimeError(f"symbol not found: {symbol}")
+        if not info.visible and not mt5.symbol_select(symbol, True):
+            raise RuntimeError(f"symbol_select failed: {symbol}")
+
+    def symbol_meta(self, symbol: str) -> SymbolMeta:
+        self.ensure_symbol(symbol)
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            raise RuntimeError(f"symbol_info failed: {symbol}")
+        return SymbolMeta(
+            symbol=symbol,
+            digits=info.digits,
+            point=info.point,
+            contract_size=info.trade_contract_size,
+            volume_min=info.volume_min,
+            volume_step=info.volume_step,
+            tick_size=info.trade_tick_size,
+            tick_value=info.trade_tick_value,
+            swap_long=info.swap_long,
+            swap_short=info.swap_short,
+        )
+
+    def copy_rates(self, symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
+        self.ensure_symbol(symbol)
+        if timeframe not in TIMEFRAMES:
+            raise RuntimeError(f"unsupported timeframe: {timeframe}")
+
+        rates = mt5.copy_rates_from_pos(symbol, TIMEFRAMES[timeframe], 0, bars)
+        if rates is None:
+            raise RuntimeError(f"copy_rates_from_pos failed for {symbol}: {mt5.last_error()}")
+
+        frame = pd.DataFrame(rates)
+        if frame.empty:
+            raise RuntimeError(f"no rates returned for {symbol}")
+
+        frame["time"] = pd.to_datetime(frame["time"], unit="s", utc=True)
+        return frame
+
+    def tick(self, symbol: str) -> dict[str, Any]:
+        self.ensure_symbol(symbol)
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            raise RuntimeError(f"symbol_info_tick failed for {symbol}: {mt5.last_error()}")
+        return tick._asdict()
+
+# src/common/__init__.py
+# src/common/__init__.py
+# Shared helpers.
+
+# src/common/logging.py
+# src/common/logging.py
+# Builds a compact console logger.
+from __future__ import annotations
+
+import logging
+
+
+def get_logger(name: str, level: str = "INFO") -> logging.Logger:
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+    logger.setLevel(level.upper())
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+# src/common/settings.py
+
+# src/common/settings.py
+# Reads environment variables into a typed settings object.
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import os
+
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+
+def _bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, str(default)).strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _int(name: str, default: int) -> int:
+    return int(os.getenv(name, default))
+
+
+def _float(name: str, default: float) -> float:
+    return float(os.getenv(name, default))
+
+
+@dataclass(slots=True)
+class Settings:
+    app_env: str
+    account_ccy: str
+    mt5_login: int
+    mt5_password: str
+    mt5_server: str
+    mt5_terminal_path: str
+    mt5_timeout_ms: int
+    mt5_reconnect_sec: int
+    mt5_portable: bool
+    mt5_magic: int
+    symbol_leg_1: str
+    symbol_leg_2: str
+    timeframe: str
+    history_bars: int
+    min_warmup_bars: int
+    beta_window_bars: int
+    spread_z_window_bars: int
+    resid_z_window_bars: int
+    corr_window_bars: int
+    vol_window_bars: int
+    min_abs_corr: float
+    min_beta_abs: float
+    max_beta_abs: float
+    entry_z_spread: float
+    entry_z_resid: float
+    exit_z: float
+    stop_z: float
+    time_stop_bars: int
+    cooldown_bars: int
+    base_lot_eurusd: float
+    risk_per_trade_usd: float
+    max_gross_notional_usd: float
+    commission_usd_per_million: float
+    commission_eurusd_usd_per_lot_one_way: float
+    commission_audusd_usd_per_lot_one_way: float
+    eurusd_spread_pips_assumed: float
+    audusd_spread_pips_assumed: float
+    eurusd_spread_pips_max: float
+    audusd_spread_pips_max: float
+    slippage_pips_per_leg: float
+    round_turn_multiplier: float
+    include_swap: bool
+    live_poll_ms: int
+    max_tick_age_ms: int
+    log_level: str
+    log_dir: Path
+    data_dir: Path
+
+
+def load_settings() -> Settings:
+    return Settings(
+        app_env=os.getenv("APP_ENV", "dev"),
+        account_ccy=os.getenv("ACCOUNT_CCY", "USD"),
+        mt5_login=_int("MT5_LOGIN", 0),
+        mt5_password=os.getenv("MT5_PASSWORD", ""),
+        mt5_server=os.getenv("MT5_SERVER", ""),
+        mt5_terminal_path=os.getenv("MT5_TERMINAL_PATH", ""),
+        mt5_timeout_ms=_int("MT5_TIMEOUT_MS", 10000),
+        mt5_reconnect_sec=_int("MT5_RECONNECT_SEC", 5),
+        mt5_portable=_bool("MT5_PORTABLE", False),
+        mt5_magic=_int("MT5_MAGIC", 420001),
+        symbol_leg_1=os.getenv("SYMBOL_LEG_1", "EURUSD"),
+        symbol_leg_2=os.getenv("SYMBOL_LEG_2", "AUDUSD"),
+        timeframe=os.getenv("TIMEFRAME", "M1"),
+        history_bars=_int("HISTORY_BARS", 2880),
+        min_warmup_bars=_int("MIN_WARMUP_BARS", 720),
+        beta_window_bars=_int("BETA_WINDOW_BARS", 1440),
+        spread_z_window_bars=_int("SPREAD_Z_WINDOW_BARS", 1440),
+        resid_z_window_bars=_int("RESID_Z_WINDOW_BARS", 1440),
+        corr_window_bars=_int("CORR_WINDOW_BARS", 1440),
+        vol_window_bars=_int("VOL_WINDOW_BARS", 60),
+        min_abs_corr=_float("MIN_ABS_CORR", 0.30),
+        min_beta_abs=_float("MIN_BETA_ABS", 0.30),
+        max_beta_abs=_float("MAX_BETA_ABS", 2.50),
+        entry_z_spread=_float("ENTRY_Z_SPREAD", 2.00),
+        entry_z_resid=_float("ENTRY_Z_RESID", 2.00),
+        exit_z=_float("EXIT_Z", 0.50),
+        stop_z=_float("STOP_Z", 3.50),
+        time_stop_bars=_int("TIME_STOP_BARS", 30),
+        cooldown_bars=_int("COOLDOWN_BARS", 5),
+        base_lot_eurusd=_float("BASE_LOT_EURUSD", 0.10),
+        risk_per_trade_usd=_float("RISK_PER_TRADE_USD", 20.0),
+        max_gross_notional_usd=_float("MAX_GROSS_NOTIONAL_USD", 50000),
+        commission_usd_per_million=_float("COMMISSION_USD_PER_MILLION", 20.0),
+        commission_eurusd_usd_per_lot_one_way=_float("COMMISSION_EURUSD_USD_PER_LOT_ONE_WAY", 2.4),
+        commission_audusd_usd_per_lot_one_way=_float("COMMISSION_AUDUSD_USD_PER_LOT_ONE_WAY", 1.5),
+        eurusd_spread_pips_assumed=_float("EURUSD_SPREAD_PIPS_ASSUMED", 0.1),
+        audusd_spread_pips_assumed=_float("AUDUSD_SPREAD_PIPS_ASSUMED", 0.3),
+        eurusd_spread_pips_max=_float("EURUSD_SPREAD_PIPS_MAX", 1.0),
+        audusd_spread_pips_max=_float("AUDUSD_SPREAD_PIPS_MAX", 1.2),
+        slippage_pips_per_leg=_float("SLIPPAGE_PIPS_PER_LEG", 0.2),
+        round_turn_multiplier=_float("ROUND_TURN_MULTIPLIER", 2.0),
+        include_swap=_bool("INCLUDE_SWAP", False),
+        live_poll_ms=_int("LIVE_POLL_MS", 250),
+        max_tick_age_ms=_int("MAX_TICK_AGE_MS", 1500),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
+        log_dir=Path(os.getenv("LOG_DIR", "./logs")),
+        data_dir=Path(os.getenv("DATA_DIR", "./data")),
+    )
+
+# src/data/__init__.py
+# src/data/__init__.py
+# Data loading helpers.
+
+# src/data/history.py
+# src/data/history.py
+# Loads and aligns bar history for both FX legs.
+from __future__ import annotations
+
+import pandas as pd
+
+from src.broker.mt5_client import MT5Client
+
+
+def load_pair_history(client: MT5Client, symbol_1: str, symbol_2: str, timeframe: str, bars: int) -> pd.DataFrame:
+    left = client.copy_rates(symbol_1, timeframe, bars)[["time", "close", "spread"]].rename(
+        columns={"close": "close_1", "spread": "bar_spread_1"}
+    )
+    right = client.copy_rates(symbol_2, timeframe, bars)[["time", "close", "spread"]].rename(
+        columns={"close": "close_2", "spread": "bar_spread_2"}
+    )
+    frame = left.merge(right, on="time", how="inner").sort_values("time").reset_index(drop=True)
+    return frame
+
+# src/strategy/__init__.py
+# src/strategy/__init__.py
+# Strategy modules.
+
+# src/strategy/costs.py
+
+# src/strategy/costs.py
+# Estimates round-turn trading costs for the two FX legs.
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from src.common.settings import Settings
+
+
+def pip_size(digits: int) -> float:
+    return 0.01 if digits in {2, 3} else 0.0001
+
+
+def pip_value_usd(contract_size: float, digits: int, lots: float) -> float:
+    return contract_size * pip_size(digits) * lots
+
+
+@dataclass(slots=True)
+class CostBreakdown:
+    lots_1: float
+    lots_2: float
+    spread_usd: float
+    commission_usd: float
+    slippage_usd: float
+    total_usd: float
+
+
+def hedge_lots(base_lot_1: float, beta: float, px_1: float, px_2: float) -> float:
+    ratio = abs(beta) * (px_1 / px_2)
+    return max(base_lot_1 * ratio, 0.0)
+
+
+def _symbol_key(symbol: str) -> str:
+    letters = "".join(ch for ch in symbol.upper() if "A" <= ch <= "Z")
+    return letters[:6]
+
+
+def commission_usd_per_lot_one_way(symbol: str, cfg: Settings) -> float | None:
+    key = _symbol_key(symbol)
+    if key == "EURUSD":
+        return cfg.commission_eurusd_usd_per_lot_one_way
+    if key == "AUDUSD":
+        return cfg.commission_audusd_usd_per_lot_one_way
+    return None
+
+
+def estimate_round_turn_cost(
+    cfg: Settings,
+    symbol_1: str,
+    symbol_2: str,
+    digits_1: int,
+    digits_2: int,
+    contract_size_1: float,
+    contract_size_2: float,
+    px_1: float,
+    px_2: float,
+    beta: float,
+    spread_pips_1: float,
+    spread_pips_2: float,
+) -> CostBreakdown:
+    lots_1 = cfg.base_lot_eurusd
+    lots_2 = hedge_lots(lots_1, beta, px_1, px_2)
+
+    spread_usd = (
+        pip_value_usd(contract_size_1, digits_1, lots_1) * spread_pips_1
+        + pip_value_usd(contract_size_2, digits_2, lots_2) * spread_pips_2
+    ) * cfg.round_turn_multiplier
+
+    rate_1 = commission_usd_per_lot_one_way(symbol_1, cfg)
+    rate_2 = commission_usd_per_lot_one_way(symbol_2, cfg)
+
+    if rate_1 is not None and rate_2 is not None:
+        commission_usd = (rate_1 * lots_1 + rate_2 * lots_2) * cfg.round_turn_multiplier
+    else:
+        notional_usd = px_1 * contract_size_1 * lots_1 + px_2 * contract_size_2 * lots_2
+        commission_usd = cfg.commission_usd_per_million * (notional_usd / 1_000_000.0) * cfg.round_turn_multiplier
+
+    slippage_usd = (
+        pip_value_usd(contract_size_1, digits_1, lots_1) * cfg.slippage_pips_per_leg
+        + pip_value_usd(contract_size_2, digits_2, lots_2) * cfg.slippage_pips_per_leg
+    ) * cfg.round_turn_multiplier
+
+    total_usd = spread_usd + commission_usd + slippage_usd
+    return CostBreakdown(lots_1, lots_2, spread_usd, commission_usd, slippage_usd, total_usd)
+
+# src/strategy/decision.py
+# src/strategy/decision.py
+# Applies entry filters and converts signal sign into leg directions.
+from __future__ import annotations
+
+import pandas as pd
+
+from src.common.settings import Settings
+
+
+def entry_side(row: pd.Series, cfg: Settings) -> int:
+    if abs(row["corr"]) < cfg.min_abs_corr:
+        return 0
+    if not (cfg.min_beta_abs <= abs(row["beta"]) <= cfg.max_beta_abs):
+        return 0
+    if abs(row["spread_z"]) < cfg.entry_z_spread:
+        return 0
+    if abs(row["resid_z"]) < cfg.entry_z_resid:
+        return 0
+    if pd.isna(row["combo_z"]):
+        return 0
+    return -1 if row["combo_z"] > 0 else 1
+
+
+def exit_hit(row: pd.Series, cfg: Settings) -> bool:
+    return abs(row["combo_z"]) <= cfg.exit_z
+
+
+def stop_hit(row: pd.Series, side: int, cfg: Settings) -> bool:
+    if pd.isna(row["combo_z"]):
+        return False
+    if side == 1 and row["combo_z"] <= -cfg.stop_z:
+        return True
+    if side == -1 and row["combo_z"] >= cfg.stop_z:
+        return True
+    return False
+
+# src/strategy/features.py
+# src/strategy/features.py
+# Computes rolling beta, spread, residual, and z-scores.
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+from src.common.settings import Settings
+
+
+EPS = 1e-12
+
+
+def _rolling_z(series: pd.Series, window: int) -> pd.Series:
+    mean = series.rolling(window).mean()
+    std = series.rolling(window).std(ddof=0).replace(0, np.nan)
+    return (series - mean) / std
+
+
+def _rolling_beta(y: pd.Series, x: pd.Series, window: int) -> pd.Series:
+    cov = y.rolling(window).cov(x)
+    var = x.rolling(window).var().replace(0, np.nan)
+    return cov / var
+
+
+def build_feature_frame(frame: pd.DataFrame, cfg: Settings) -> pd.DataFrame:
+    out = frame.copy()
+    out["log_1"] = np.log(out["close_1"].clip(lower=EPS))
+    out["log_2"] = np.log(out["close_2"].clip(lower=EPS))
+    out["ret_1"] = out["log_1"].diff()
+    out["ret_2"] = out["log_2"].diff()
+    out["beta"] = _rolling_beta(out["ret_1"], out["ret_2"], cfg.beta_window_bars)
+    x_mean = out["ret_2"].rolling(cfg.beta_window_bars).mean()
+    y_mean = out["ret_1"].rolling(cfg.beta_window_bars).mean()
+    out["alpha"] = y_mean - out["beta"] * x_mean
+    out["corr"] = out["ret_1"].rolling(cfg.corr_window_bars).corr(out["ret_2"])
+    out["spread_raw"] = out["log_1"] - out["beta"] * out["log_2"]
+    out["spread_z"] = _rolling_z(out["spread_raw"], cfg.spread_z_window_bars)
+    out["resid_raw"] = out["ret_1"] - (out["alpha"] + out["beta"] * out["ret_2"])
+    out["resid_z"] = _rolling_z(out["resid_raw"], cfg.resid_z_window_bars)
+    same_sign = np.sign(out["spread_z"]) == np.sign(out["resid_z"])
+    out["combo_z"] = np.where(same_sign, (out["spread_z"] + out["resid_z"]) / 2.0, np.nan)
+    out["abs_combo_z"] = out["combo_z"].abs()
+    out["vol_1"] = out["ret_1"].rolling(cfg.vol_window_bars).std(ddof=0)
+    out["vol_2"] = out["ret_2"].rolling(cfg.vol_window_bars).std(ddof=0)
+    return out.dropna().reset_index(drop=True)
+
+# src/strategy/simulator.py
+
+# src/strategy/simulator.py
+# Runs a simple event-study and estimates current live edge.
+from __future__ import annotations
+
+from dataclasses import asdict
+
+import pandas as pd
+
+from src.broker.mt5_client import SymbolMeta
+from src.common.settings import Settings
+from src.strategy.costs import estimate_round_turn_cost
+from src.strategy.decision import entry_side, exit_hit, stop_hit
+
+
+def _gross_pnl_usd(
+    side: int,
+    entry_1: float,
+    entry_2: float,
+    exit_1: float,
+    exit_2: float,
+    lots_1: float,
+    lots_2: float,
+    cs_1: float,
+    cs_2: float,
+) -> float:
+    pnl_1 = side * (exit_1 - entry_1) * cs_1 * lots_1
+    pnl_2 = -side * (exit_2 - entry_2) * cs_2 * lots_2
+    return pnl_1 + pnl_2
+
+
+def simulate_trades(frame: pd.DataFrame, cfg: Settings, meta_1: SymbolMeta, meta_2: SymbolMeta) -> pd.DataFrame:
+    rows: list[dict] = []
+    i = 0
+    limit = len(frame) - 1
+
+    while i < limit:
+        row = frame.iloc[i]
+        side = entry_side(row, cfg)
+        if not side:
+            i += 1
+            continue
+
+        spread_1 = cfg.eurusd_spread_pips_assumed
+        spread_2 = cfg.audusd_spread_pips_assumed
+
+        costs = estimate_round_turn_cost(
+            cfg=cfg,
+            symbol_1=meta_1.symbol,
+            symbol_2=meta_2.symbol,
+            digits_1=meta_1.digits,
+            digits_2=meta_2.digits,
+            contract_size_1=meta_1.contract_size,
+            contract_size_2=meta_2.contract_size,
+            px_1=float(row["close_1"]),
+            px_2=float(row["close_2"]),
+            beta=float(row["beta"]),
+            spread_pips_1=spread_1,
+            spread_pips_2=spread_2,
+        )
+
+        entry_ix = i
+        exit_ix = min(i + cfg.time_stop_bars, limit)
+        reason = "time"
+
+        for j in range(i + 1, min(i + cfg.time_stop_bars, limit) + 1):
+            probe = frame.iloc[j]
+            if exit_hit(probe, cfg):
+                exit_ix = j
+                reason = "exit"
+                break
+            if stop_hit(probe, side, cfg):
+                exit_ix = j
+                reason = "stop"
+                break
+
+        exit_row = frame.iloc[exit_ix]
+
+        gross = _gross_pnl_usd(
+            side=side,
+            entry_1=float(row["close_1"]),
+            entry_2=float(row["close_2"]),
+            exit_1=float(exit_row["close_1"]),
+            exit_2=float(exit_row["close_2"]),
+            lots_1=costs.lots_1,
+            lots_2=costs.lots_2,
+            cs_1=meta_1.contract_size,
+            cs_2=meta_2.contract_size,
+        )
+
+        rows.append(
+            {
+                "entry_time": row["time"],
+                "exit_time": exit_row["time"],
+                "hold_bars": int(exit_ix - entry_ix),
+                "reason": reason,
+                "side": int(side),
+                "beta": float(row["beta"]),
+                "corr": float(row["corr"]),
+                "spread_z": float(row["spread_z"]),
+                "resid_z": float(row["resid_z"]),
+                "combo_z": float(row["combo_z"]),
+                "gross_pnl_usd": float(gross),
+                **{f"cost_{k}": v for k, v in asdict(costs).items()},
+                "net_pnl_usd": float(gross - costs.total_usd),
+            }
+        )
+
+        i = exit_ix + cfg.cooldown_bars
+
+    return pd.DataFrame(rows)
+
+
+def summarize_trades(trades: pd.DataFrame) -> dict[str, float]:
+    if trades.empty:
+        return {
+            "trades": 0.0,
+            "win_rate": 0.0,
+            "gross_pnl_usd": 0.0,
+            "net_pnl_usd": 0.0,
+        }
+
+    return {
+        "trades": float(len(trades)),
+        "win_rate": float((trades["net_pnl_usd"] > 0).mean()),
+        "gross_pnl_usd": float(trades["gross_pnl_usd"].sum()),
+        "net_pnl_usd": float(trades["net_pnl_usd"].sum()),
+        "avg_net_pnl_usd": float(trades["net_pnl_usd"].mean()),
+        "median_hold_bars": float(trades["hold_bars"].median()),
+    }
+
+
+def estimate_live_edge(frame: pd.DataFrame, trades: pd.DataFrame, cfg: Settings) -> dict[str, float | int | str] | None:
+    if frame.empty:
+        return None
+
+    row = frame.iloc[-1]
+    side = entry_side(row, cfg)
+
+    combo_z = float(row["combo_z"]) if pd.notna(row["combo_z"]) else float("nan")
+    spread_z = float(row["spread_z"]) if pd.notna(row["spread_z"]) else float("nan")
+    resid_z = float(row["resid_z"]) if pd.notna(row["resid_z"]) else float("nan")
+    corr = float(row["corr"]) if pd.notna(row["corr"]) else float("nan")
+    beta = float(row["beta"]) if pd.notna(row["beta"]) else float("nan")
+
+    if not side:
+        return {
+            "status": "no_entry",
+            "combo_z": combo_z,
+            "spread_z": spread_z,
+            "resid_z": resid_z,
+            "corr": corr,
+            "beta": beta,
+        }
+
+    if trades.empty:
+        return {
+            "status": "entry_but_no_history",
+            "side": int(side),
+            "combo_z": combo_z,
+            "spread_z": spread_z,
+            "resid_z": resid_z,
+            "corr": corr,
+            "beta": beta,
+        }
+
+    sample = trades[trades["side"] == side].copy()
+    sample["distance"] = (sample["combo_z"] - combo_z).abs()
+    sample = sample.sort_values("distance").head(20)
+
+    if sample.empty:
+        return {
+            "status": "entry_but_no_matches",
+            "side": int(side),
+            "combo_z": combo_z,
+            "spread_z": spread_z,
+            "resid_z": resid_z,
+            "corr": corr,
+            "beta": beta,
+        }
+
+    mean_net = float(sample["net_pnl_usd"].mean())
+
+    return {
+        "status": "entry" if mean_net > 0 else "skip",
+        "side": int(side),
+        "combo_z": combo_z,
+        "spread_z": spread_z,
+        "resid_z": resid_z,
+        "corr": corr,
+        "beta": beta,
+        "sample_n": int(len(sample)),
+        "hist_mean_net_pnl_usd": mean_net,
+        "hist_median_net_pnl_usd": float(sample["net_pnl_usd"].median()),
+        "hist_win_rate": float((sample["net_pnl_usd"] > 0).mean()),
+    }

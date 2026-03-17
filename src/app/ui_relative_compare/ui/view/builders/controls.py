@@ -18,13 +18,7 @@ def build_controls(window, parent) -> None:
     window.symbol_2_box.grid(row=0, column=3, padx=(6, 14), sticky="w")
 
     ttk.Label(controls, text="Timeframe").grid(row=0, column=4, sticky="w")
-    ttk.Combobox(
-        controls,
-        textvariable=window.timeframe_var,
-        values=list(TIMEFRAME_MINUTES.keys()),
-        state="readonly",
-        width=8,
-    ).grid(row=0, column=5, padx=(6, 14), sticky="w")
+    ttk.Combobox(controls, textvariable=window.timeframe_var, values=list(TIMEFRAME_MINUTES.keys()), state="readonly", width=8).grid(row=0, column=5, padx=(6, 14), sticky="w")
 
     ttk.Label(controls, text="Баров в ленте").grid(row=0, column=6, sticky="w")
     ttk.Entry(controls, textvariable=window.visible_bars_var, width=8).grid(row=0, column=7, padx=(6, 14), sticky="w")
@@ -32,60 +26,31 @@ def build_controls(window, parent) -> None:
     ttk.Label(controls, text="Refresh ms").grid(row=0, column=8, sticky="w")
     ttk.Entry(controls, textvariable=window.refresh_ms_var, width=8).grid(row=0, column=9, padx=(6, 14), sticky="w")
 
-    ttk.Label(controls, text="Коэф 1/2").grid(row=0, column=10, sticky="w")
-    ttk.Entry(controls, textvariable=window.manual_ratio_1_to_2_var, width=10).grid(row=0, column=11, padx=(6, 14), sticky="w")
+    ttk.Label(controls, text="Базовый торговый лот").grid(row=1, column=0, sticky="w", pady=(10, 0))
+    ttk.Entry(controls, textvariable=window.base_trading_lot_var, width=8).grid(row=1, column=1, padx=(6, 14), pady=(10, 0), sticky="w")
 
-    ttk.Label(controls, text="Fast MA").grid(row=1, column=0, sticky="w", pady=(10, 0))
-    ttk.Entry(controls, textvariable=window.signal_fast_ma_var, width=8).grid(row=1, column=1, padx=(6, 14), pady=(10, 0), sticky="w")
+    ttk.Label(controls, text="Баров в 1 свече").grid(row=1, column=2, sticky="w", pady=(10, 0))
+    ttk.Entry(controls, textvariable=window.aggregate_bars_var, width=8).grid(row=1, column=3, padx=(6, 14), pady=(10, 0), sticky="w")
 
-    ttk.Label(controls, text="Slow MA").grid(row=1, column=2, sticky="w", pady=(10, 0))
-    ttk.Entry(controls, textvariable=window.signal_slow_ma_var, width=8).grid(row=1, column=3, padx=(6, 14), pady=(10, 0), sticky="w")
+    coeff = ttk.LabelFrame(controls, text="Коэффициент стоимости", padding=8)
+    coeff.grid(row=1, column=4, columnspan=6, rowspan=2, sticky="w", padx=(0, 14), pady=(10, 0))
 
-    ttk.Label(controls, text="Порог входа").grid(row=1, column=4, sticky="w", pady=(10, 0))
-    ttk.Entry(controls, textvariable=window.signal_entry_threshold_var, width=8).grid(row=1, column=5, padx=(6, 14), pady=(10, 0), sticky="w")
+    ttk.Checkbutton(coeff, variable=window.cost_coeff_1_enabled_var, command=window.controller.on_cost_coeff_changed).grid(row=0, column=0, sticky="w")
+    ttk.Label(coeff, textvariable=window.action_pair_1_var).grid(row=0, column=1, sticky="w", padx=(2, 6))
+    ttk.Entry(coeff, textvariable=window.cost_coeff_1_var, width=8).grid(row=0, column=2, sticky="w", padx=(0, 14))
 
-    ttk.Label(controls, text="Порог выхода").grid(row=1, column=6, sticky="w", pady=(10, 0))
-    ttk.Entry(controls, textvariable=window.signal_exit_threshold_var, width=8).grid(row=1, column=7, padx=(6, 14), pady=(10, 0), sticky="w")
+    ttk.Checkbutton(coeff, variable=window.cost_coeff_2_enabled_var, command=window.controller.on_cost_coeff_changed).grid(row=0, column=3, sticky="w")
+    ttk.Label(coeff, textvariable=window.action_pair_2_var).grid(row=0, column=4, sticky="w", padx=(2, 6))
+    ttk.Entry(coeff, textvariable=window.cost_coeff_2_var, width=8).grid(row=0, column=5, sticky="w")
 
-    ttk.Checkbutton(
-        controls,
-        text="Нижний график: gap + diff(fast-slow)",
-        variable=window.line_chart_mode_var,
-        onvalue="gap_diff",
-        offvalue="gap_ma",
-        command=window.controller.on_line_chart_mode_changed,
-    ).grid(row=1, column=8, columnspan=4, padx=(6, 14), pady=(10, 0), sticky="w")
+    ttk.Label(controls, textvariable=window.manual_lot_1_label_var).grid(row=2, column=0, pady=(10, 0), sticky="w")
+    ttk.Label(controls, textvariable=window.final_lot_1_var).grid(row=2, column=1, pady=(10, 0), sticky="w")
+    ttk.Label(controls, textvariable=window.manual_lot_2_label_var).grid(row=2, column=2, pady=(10, 0), sticky="w")
+    ttk.Label(controls, textvariable=window.final_lot_2_var).grid(row=2, column=3, pady=(10, 0), sticky="w")
 
-    ttk.Checkbutton(
-        controls,
-        text="Отрицательная корреляция",
-        variable=window.negative_correlation_var,
-        command=window.controller.on_toggle_negative_correlation,
-    ).grid(row=2, column=0, columnspan=2, pady=(10, 0), sticky="w")
+    ttk.Checkbutton(controls, text="Взаимоисключение движения", variable=window.mutual_exclusion_var, command=window.controller.on_toggle_mutual_exclusion).grid(row=2, column=10, columnspan=2, pady=(10, 0), sticky="w")
 
-    ttk.Checkbutton(
-        controls,
-        text="Взаимоисключение движения",
-        variable=window.mutual_exclusion_var,
-        command=window.controller.on_toggle_mutual_exclusion,
-    ).grid(row=2, column=2, columnspan=2, pady=(10, 0), sticky="w")
-
-    ttk.Checkbutton(
-        controls,
-        text="Объем автоматически",
-        variable=window.auto_volume_var,
-        command=window.controller.on_toggle_auto_volume,
-    ).grid(row=2, column=4, columnspan=2, pady=(10, 0), sticky="w")
-
-    ttk.Label(controls, textvariable=window.manual_lot_1_label_var).grid(row=2, column=6, pady=(10, 0), sticky="w")
-    window.manual_lot_1_entry = ttk.Entry(controls, textvariable=window.manual_lot_1_var, width=8)
-    window.manual_lot_1_entry.grid(row=2, column=7, padx=(6, 14), pady=(10, 0), sticky="w")
-
-    ttk.Label(controls, textvariable=window.manual_lot_2_label_var).grid(row=2, column=8, pady=(10, 0), sticky="w")
-    window.manual_lot_2_entry = ttk.Entry(controls, textvariable=window.manual_lot_2_var, width=8)
-    window.manual_lot_2_entry.grid(row=2, column=9, padx=(6, 14), pady=(10, 0), sticky="w")
-
-    ttk.Button(controls, text="Подключить MT5", command=window.controller.connect_mt5).grid(row=2, column=10, pady=(10, 0), sticky="w")
-    ttk.Button(controls, text="Старт", command=window.controller.start_live).grid(row=2, column=11, pady=(10, 0), sticky="w")
-    ttk.Button(controls, text="Стоп", command=window.controller.stop_live).grid(row=2, column=12, pady=(10, 0), sticky="w")
-    ttk.Button(controls, text="Разовый рендер", command=window.controller.render_once).grid(row=2, column=13, pady=(10, 0), sticky="w")
+    ttk.Button(controls, text="Подключить MT5", command=window.controller.connect_mt5).grid(row=2, column=12, pady=(10, 0), sticky="w")
+    ttk.Button(controls, text="Старт", command=window.controller.start_live).grid(row=2, column=13, pady=(10, 0), sticky="w")
+    ttk.Button(controls, text="Стоп", command=window.controller.stop_live).grid(row=2, column=14, pady=(10, 0), sticky="w")
+    ttk.Button(controls, text="Разовый рендер", command=window.controller.render_once).grid(row=2, column=15, pady=(10, 0), sticky="w")

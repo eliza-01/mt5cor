@@ -27,8 +27,15 @@ class ControllerLayoutMixin:
         return "break"
 
     def update_pane_toggle_labels(self) -> None:
+        self.view.sizing_toggle_var.set("▸" if self.view.sizing_collapsed else "▾")
         self.view.candle_toggle_var.set("▸" if self.view.candle_collapsed else "▾")
         self.view.line_toggle_var.set("▸" if self.view.line_collapsed else "▾")
+
+    def toggle_sizing_panel(self) -> None:
+        self.view.sizing_collapsed = not self.view.sizing_collapsed
+        self.update_pane_toggle_labels()
+        self.view.set_panel_body_visible(self.view.sizing_body, not self.view.sizing_collapsed)
+        self.schedule_state_save()
 
     def toggle_candle_panel(self) -> None:
         if not self.view.candle_collapsed:
@@ -50,6 +57,7 @@ class ControllerLayoutMixin:
             self.update_pane_toggle_labels()
             self.view.set_panel_body_visible(self.view.candle_body, not self.view.candle_collapsed)
             self.view.set_panel_body_visible(self.view.line_body, not self.view.line_collapsed)
+            self.view.set_panel_body_visible(self.view.sizing_body, not self.view.sizing_collapsed)
 
             total_height = max(int(self.view.chart_panes.winfo_height()), 380)
             candle_min = PANE_MIN_COLLAPSED if self.view.candle_collapsed else PANE_MIN_EXPANDED_TOP
@@ -77,14 +85,14 @@ class ControllerLayoutMixin:
             self.view.height_size_var.set(f"{self.view.height_adjust_px:+d}px")
         self.schedule_state_save()
         if self.current_snapshot is not None:
-            self.render_once()
+            self.redraw_current_snapshot()
 
     def change_pair_gap(self, delta: int) -> None:
         self.view.pair_gap_adjust_px += delta
         self.view.pair_gap_size_var.set(f"{self.view.pair_gap_adjust_px:+d}px")
         self.schedule_state_save()
         if self.current_snapshot is not None:
-            self.render_once()
+            self.redraw_current_snapshot()
 
     def reset_size(self) -> None:
         self.view.width_adjust_px = 0
@@ -95,4 +103,4 @@ class ControllerLayoutMixin:
         self.view.pair_gap_size_var.set("0px")
         self.schedule_state_save()
         if self.current_snapshot is not None:
-            self.render_once()
+            self.redraw_current_snapshot()

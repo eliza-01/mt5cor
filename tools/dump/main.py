@@ -45,9 +45,9 @@ ALL_FILES: bool = True
 
 # Директории (относительно корня проекта), из которых собираем ВСЁ рекурсивно.
 INCLUDE_DIRS: List[str] = [
-    # "src",
+    "src",
     # "data",
-    "src/app/ui_relative_compare",
+    # "src/app/ui_relative_compare",
     # "fxrelval_mt5/src",
     # "src/app/ui_relative_compare",
 ]

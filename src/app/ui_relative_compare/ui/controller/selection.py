@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pandas as pd
+
 from src.app.ui_relative_compare.services.market.transform import transform_price_delta_to_pips
 from .helpers import format_pips, format_symbol_for_stats
 
@@ -37,7 +39,6 @@ class ControllerSelectionMixin:
             if delta == 0:
                 return "break"
             delta_units = -3 if delta > 0 else 3
-
         self.view.candle_canvas.xview_scroll(delta_units, "units")
         self.view.line_canvas.xview_scroll(delta_units, "units")
         return "break"
@@ -67,16 +68,27 @@ class ControllerSelectionMixin:
             return
         canvas = self.view.candle_canvas if widget is self.view.candle_canvas else self.view.line_canvas
         x_world = float(canvas.canvasx(x_local))
-        index = self.chart.get_index_at_x(
-            bars_count=len(self.current_snapshot.bars),
-            x_world=x_world,
-            width_adjust_px=self.view.width_adjust_px,
-            pair_gap_adjust_px=self.view.pair_gap_adjust_px,
-        )
+        index = self.chart.get_index_at_x(len(self.current_snapshot.bars), x_world, self.view.width_adjust_px, self.view.pair_gap_adjust_px)
         if index is None:
             return
         self.selection.register_click(self.current_snapshot.bars, index)
         self.redraw_current_snapshot()
+
+    def _format_range_start_end(self, start_ts, end_ts, candles_distance: int) -> str:
+        start = pd.Timestamp(start_ts)
+        end = pd.Timestamp(end_ts)
+        same_year = start.year == end.year
+        same_day = start.normalize() == end.normalize()
+        if same_day:
+            start_text = start.strftime("%H:%M:%S")
+            end_text = end.strftime("%H:%M:%S")
+        elif same_year:
+            start_text = start.strftime("%d.%m %H:%M:%S")
+            end_text = end.strftime("%d.%m %H:%M:%S")
+        else:
+            start_text = start.strftime("%d.%m.%Y %H:%M:%S")
+            end_text = end.strftime("%d.%m.%Y %H:%M:%S")
+        return f"{start_text} ->\n{end_text} ({candles_distance} свечей)"
 
     def update_selection_stats(self) -> None:
         if self.current_snapshot is None or self.current_snapshot.bars.empty:
@@ -100,30 +112,18 @@ class ControllerSelectionMixin:
         end_row = bars.iloc[end_index]
 
         if self.selection.end_index is None:
-            self.view.selection_range_var.set(f"START: {start_row['time']} | жду END")
+            self.view.selection_range_var.set(f"START: {pd.Timestamp(start_row['time']).strftime('%H:%M:%S')} ->\nжду END")
             self.view.selection_pair_1_var.set("-")
             self.view.selection_pair_2_var.set("-")
             self.view.selection_diff_var.set("-")
             return
 
-        move_1_pips = float(
-            transform_price_delta_to_pips(
-                float(end_row["close_1"]) - float(start_row["close_1"]),
-                self.current_snapshot.digits_1,
-            )
-        )
-        move_2_pips = float(
-            transform_price_delta_to_pips(
-                float(end_row["close_2"]) - float(start_row["close_2"]),
-                self.current_snapshot.digits_2,
-                self.current_snapshot.ratio_1_to_2,
-                self.current_snapshot.negative_correlation,
-            )
-        )
+        move_1_pips = float(transform_price_delta_to_pips(float(end_row["close_1"]) - float(start_row["close_1"]), self.current_snapshot.digits_1))
+        move_2_pips = float(transform_price_delta_to_pips(float(end_row["close_2"]) - float(start_row["close_2"]), self.current_snapshot.digits_2, 1.0, self.current_snapshot.negative_correlation))
         diff_pips = move_1_pips - move_2_pips
         candles_distance = max(0, end_index - start_index)
 
-        self.view.selection_range_var.set(f"{start_row['time']} -> {end_row['time']} | свечей между точками: {candles_distance}")
-        self.view.selection_pair_1_var.set(f"{format_symbol_for_stats(self.view.symbol_1_var.get().strip())}: {format_pips(move_1_pips)} pip")
-        self.view.selection_pair_2_var.set(f"{format_symbol_for_stats(self.view.symbol_2_var.get().strip())}: {format_pips(move_2_pips)} pip")
-        self.view.selection_diff_var.set(f"diff: {format_pips(diff_pips)} pip")
+        self.view.selection_range_var.set(self._format_range_start_end(start_row["time"], end_row["time"], candles_distance))
+        self.view.selection_pair_1_var.set(f"{format_symbol_for_stats(self.view.symbol_1_var.get().strip())}: {format_pips(move_1_pips)}")
+        self.view.selection_pair_2_var.set(f"{format_symbol_for_stats(self.view.symbol_2_var.get().strip())}: {format_pips(move_2_pips)}")
+        self.view.selection_diff_var.set(f"diff: {format_pips(diff_pips)}")

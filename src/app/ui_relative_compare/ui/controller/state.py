@@ -16,17 +16,15 @@ class ControllerStateMixin:
             self.view.visible_bars_var,
             self.view.refresh_ms_var,
             self.view.aggregate_bars_var,
-            self.view.manual_ratio_1_to_2_var,
-            self.view.negative_correlation_var,
+            self.view.base_trading_lot_var,
+            self.view.cost_coeff_1_var,
+            self.view.cost_coeff_2_var,
+            self.view.cost_coeff_1_enabled_var,
+            self.view.cost_coeff_2_enabled_var,
             self.view.mutual_exclusion_var,
-            self.view.auto_volume_var,
-            self.view.manual_lot_1_var,
-            self.view.manual_lot_2_var,
-            self.view.signal_fast_ma_var,
-            self.view.signal_slow_ma_var,
-            self.view.signal_entry_threshold_var,
-            self.view.signal_exit_threshold_var,
-            self.view.line_chart_mode_var,
+            self.view.apply_long_ratio_var,
+            self.view.apply_short_ratio_var,
+            self.view.apply_common_ratio_var,
             self.view.line_zoom_var,
         ]
         for var in tracked:
@@ -34,14 +32,9 @@ class ControllerStateMixin:
 
         self.view.symbol_1_var.trace_add("write", self.on_symbols_changed)
         self.view.symbol_2_var.trace_add("write", self.on_symbols_changed)
-        self.view.manual_lot_1_var.trace_add("write", self.on_manual_volume_changed)
-        self.view.manual_lot_2_var.trace_add("write", self.on_manual_volume_changed)
-        self.view.manual_ratio_1_to_2_var.trace_add("write", self.on_manual_ratio_changed)
-        self.view.signal_fast_ma_var.trace_add("write", self.on_signal_param_changed)
-        self.view.signal_slow_ma_var.trace_add("write", self.on_signal_param_changed)
-        self.view.signal_entry_threshold_var.trace_add("write", self.on_signal_param_changed)
-        self.view.signal_exit_threshold_var.trace_add("write", self.on_signal_param_changed)
-
+        self.view.base_trading_lot_var.trace_add("write", self.on_lot_inputs_changed)
+        self.view.cost_coeff_1_var.trace_add("write", self.on_lot_inputs_changed)
+        self.view.cost_coeff_2_var.trace_add("write", self.on_lot_inputs_changed)
         self.view.bind("<Configure>", self.on_window_configure)
         self.view.chart_panes.bind("<ButtonRelease-1>", self.on_chart_panes_release)
 
@@ -69,26 +62,25 @@ class ControllerStateMixin:
     def collect_ui_state(self) -> UIState:
         return UIState(
             symbol_1=self.view.symbol_1_var.get().strip() or "EURUSD",
-            symbol_2=self.view.symbol_2_var.get().strip() or "AUDUSD",
+            symbol_2=self.view.symbol_2_var.get().strip() or "USDCHF",
             timeframe=self.view.timeframe_var.get().strip() or "M1",
-            visible_bars=self.view.visible_bars_var.get().strip() or "120",
+            visible_bars=self.view.visible_bars_var.get().strip() or "1200",
             refresh_ms=self.view.refresh_ms_var.get().strip() or "250",
             aggregate_bars=self.view.aggregate_bars_var.get().strip() or "1",
-            manual_ratio_1_to_2=self.view.manual_ratio_1_to_2_var.get().strip() or "1.000000",
-            negative_correlation=bool(self.view.negative_correlation_var.get()),
+            base_trading_lot=self.view.base_trading_lot_var.get().strip() or "0.10",
+            cost_coeff_1=self.view.cost_coeff_1_var.get().strip() or "1.00",
+            cost_coeff_2=self.view.cost_coeff_2_var.get().strip() or "1.00",
+            cost_coeff_1_enabled=bool(self.view.cost_coeff_1_enabled_var.get()),
+            cost_coeff_2_enabled=bool(self.view.cost_coeff_2_enabled_var.get()),
             mutual_exclusion_enabled=bool(self.view.mutual_exclusion_var.get()),
-            auto_volume=bool(self.view.auto_volume_var.get()),
-            manual_lot_1=self.view.manual_lot_1_var.get().strip() or "0.10",
-            manual_lot_2=self.view.manual_lot_2_var.get().strip() or "0.10",
-            signal_fast_ma=self.view.signal_fast_ma_var.get().strip() or "8",
-            signal_slow_ma=self.view.signal_slow_ma_var.get().strip() or "34",
-            signal_entry_threshold=self.view.signal_entry_threshold_var.get().strip() or "12.0",
-            signal_exit_threshold=self.view.signal_exit_threshold_var.get().strip() or "3.0",
-            line_chart_mode=self.view.line_chart_mode_var.get().strip() or "gap_ma",
+            apply_long_ratio=bool(self.view.apply_long_ratio_var.get()),
+            apply_short_ratio=bool(self.view.apply_short_ratio_var.get()),
+            apply_common_ratio=bool(self.view.apply_common_ratio_var.get()),
             width_adjust_px=int(self.view.width_adjust_px),
             height_adjust_px=int(self.view.height_adjust_px),
             pair_gap_adjust_px=int(self.view.pair_gap_adjust_px),
             chart_split_y=int(self.view.chart_split_y if (self.view.candle_collapsed or self.view.line_collapsed) else self.view.current_chart_split_y()),
+            sizing_collapsed=bool(self.view.sizing_collapsed),
             candle_collapsed=bool(self.view.candle_collapsed),
             line_collapsed=bool(self.view.line_collapsed),
             pair_1_up_color=self.view.chart_colors["pair_1_up"],
@@ -135,9 +127,9 @@ class ControllerStateMixin:
 
     def update_symbol_labels(self) -> None:
         symbol_1 = self.view.symbol_1_var.get().strip() or "EURUSD"
-        symbol_2 = self.view.symbol_2_var.get().strip() or "AUDUSD"
-        self.view.manual_lot_1_label_var.set(f"Lot {normalize_symbol(symbol_1)}")
-        self.view.manual_lot_2_label_var.set(f"Lot {normalize_symbol(symbol_2)}")
+        symbol_2 = self.view.symbol_2_var.get().strip() or "USDCHF"
+        self.view.manual_lot_1_label_var.set(f"Итог {normalize_symbol(symbol_1)}")
+        self.view.manual_lot_2_label_var.set(f"Итог {normalize_symbol(symbol_2)}")
         self.view.header_symbol_1_var.set(base_label(symbol_1))
         self.view.header_symbol_2_var.set(base_label(symbol_2))
         self.view.action_pair_1_var.set(normalize_symbol(symbol_1))
@@ -145,23 +137,34 @@ class ControllerStateMixin:
 
     def on_symbols_changed(self, *_args) -> None:
         self.update_symbol_labels()
+        self.update_final_lots_preview()
         self.schedule_state_save()
 
-    def on_manual_volume_changed(self, *_args) -> None:
-        if not self.view.auto_volume_var.get():
-            self.update_trade_hint()
-
-    def on_manual_ratio_changed(self, *_args) -> None:
+    def on_lot_inputs_changed(self, *_args) -> None:
+        self.update_final_lots_preview()
         self.update_trade_hint()
 
-    def on_signal_param_changed(self, *_args) -> None:
-        self.update_trade_hint()
+    def update_final_lots_preview(self) -> None:
+        try:
+            lot_1, lot_2 = self.resolve_pair_lots()
+            self.view.final_lot_1_var.set(f"{lot_1:.2f}")
+            self.view.final_lot_2_var.set(f"{lot_2:.2f}")
+        except Exception:
+            self.view.final_lot_1_var.set("-")
+            self.view.final_lot_2_var.set("-")
 
-    def on_line_chart_mode_changed(self) -> None:
+    def on_ratio_checkbox_changed(self) -> None:
+        if self.view.apply_common_ratio_var.get():
+            self.view.apply_long_ratio_var.set(False)
+            self.view.apply_short_ratio_var.set(False)
+        elif self.view.apply_long_ratio_var.get() or self.view.apply_short_ratio_var.get():
+            self.view.apply_common_ratio_var.set(False)
         if self.current_snapshot is not None:
-            self.redraw_current_snapshot()
+            self.render_once()
 
+    def on_cost_coeff_changed(self) -> None:
+        self.update_final_lots_preview()
+        if self.current_snapshot is not None:
+            self.render_once()
     def update_manual_volume_state(self) -> None:
-        state = "disabled" if self.view.auto_volume_var.get() else "normal"
-        self.view.manual_lot_1_entry.configure(state=state)
-        self.view.manual_lot_2_entry.configure(state=state)
+        self.update_final_lots_preview()

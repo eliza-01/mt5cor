@@ -7,22 +7,17 @@ import pandas as pd
 
 @dataclass(slots=True)
 class SignalPlotSeries:
-    gap: pd.Series
-    fast_ma: pd.Series
-    slow_ma: pd.Series
-    ma_diff: pd.Series
+    line_1: pd.Series
+    line_2: pd.Series
+    diff: pd.Series
+    applied_ratio_long: float
+    applied_ratio_short: float
 
 
 @dataclass(slots=True)
 class SignalComputationResult:
-    fast_window: int
-    slow_window: int
-    entry_threshold: float
-    exit_threshold: float
-    gap_last: float
-    fast_last: float
-    slow_last: float
-    ma_diff_last: float
-    signal_side: str
-    entry_ready: bool
-    exit_ready: bool
+    line_1_last: float
+    line_2_last: float
+    diff_last: float
+    applied_ratio_long: float
+    applied_ratio_short: float
