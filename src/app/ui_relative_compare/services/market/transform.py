@@ -26,9 +26,19 @@ def build_relative_bars(
     invert_second: bool = False,
 ) -> pd.DataFrame:
     out = frame.copy()
-    out["p1_high"] = transform_price_delta_to_pips(out["high_1"] - out["open_1"], digits_1)
-    out["p1_low"] = transform_price_delta_to_pips(out["low_1"] - out["open_1"], digits_1)
-    out["p1_close"] = transform_price_delta_to_pips(out["close_1"] - out["open_1"], digits_1)
+
+    out["p1_high"] = transform_price_delta_to_pips(
+        out["high_1"] - out["open_1"],
+        digits_1,
+    )
+    out["p1_low"] = transform_price_delta_to_pips(
+        out["low_1"] - out["open_1"],
+        digits_1,
+    )
+    out["p1_close"] = transform_price_delta_to_pips(
+        out["close_1"] - out["open_1"],
+        digits_1,
+    )
 
     out["p2_high"] = transform_price_delta_to_pips(
         out["high_2"] - out["open_2"],

@@ -34,7 +34,7 @@ def build_info_blocks(window, parent) -> None:
     kv(info, 1, 0, "Коэф 1/2", window.manual_ratio_1_to_2_var)
     kv(info, 1, 2, "Сборка", window.aggregate_info_var)
 
-    trade = ttk.LabelFrame(parent, text="Текущая логика и объем", padding=10)
+    trade = ttk.LabelFrame(parent, text="Сигнал и объем", padding=10)
     trade.pack(fill="x", pady=(10, 0))
     kv(trade, 0, 0, "Состояние", window.trade_hint_var)
 

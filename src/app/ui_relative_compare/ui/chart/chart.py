@@ -4,11 +4,11 @@ import tkinter as tk
 
 import pandas as pd
 
-from src.app.ui_relative_compare.domain import TradePlan
+from src.app.ui_relative_compare.domain import SignalDiagnostics, TradePlan
 from .candles import render_candles
 from .layout import LEFT_PAD, pair_layout
 from .lines import render_relative_lines
-from .series import build_relative_line_series
+from .series import build_signal_line_series
 
 
 class RelativeChart:
@@ -34,6 +34,8 @@ class RelativeChart:
         digits_1: int,
         digits_2: int,
         mutual_exclusion_enabled: bool,
+        signal_diagnostics: SignalDiagnostics,
+        line_chart_mode: str,
     ) -> None:
         render_candles(
             canvas=self.candle_canvas,
@@ -50,24 +52,30 @@ class RelativeChart:
             selected_end_index=selected_end_index,
             colors=colors,
         )
-        line_1, line_2 = build_relative_line_series(
+        gap, fast_ma, slow_ma = build_signal_line_series(
             bars,
             digits_1=digits_1,
             digits_2=digits_2,
             ratio_1_to_2=ratio_1_to_2,
             invert_second=invert_second,
             mutual_exclusion_enabled=mutual_exclusion_enabled,
+            fast_window=signal_diagnostics.fast_window,
+            slow_window=signal_diagnostics.slow_window,
         )
         render_relative_lines(
             canvas=self.line_canvas,
-            line_1=line_1,
-            line_2=line_2,
+            gap=gap,
+            fast_ma=fast_ma,
+            slow_ma=slow_ma,
             width_adjust_px=width_adjust_px,
             pair_gap_adjust_px=pair_gap_adjust_px,
             selected_start_index=selected_start_index,
             selected_end_index=selected_end_index,
             colors=colors,
             line_zoom=line_zoom,
+            entry_threshold=signal_diagnostics.entry_threshold,
+            exit_threshold=signal_diagnostics.exit_threshold,
+            chart_mode=line_chart_mode,
         )
 
     def get_index_at_x(self, bars_count: int, x_world: float, width_adjust_px: int, pair_gap_adjust_px: int) -> int | None:

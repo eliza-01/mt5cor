@@ -118,15 +118,16 @@ def render_candles(
 
     sell_color = "#ef4444"
     buy_color = "#2563eb"
-    for point in last_points:
-        if trade_plan.sell_symbol == symbol_1:
-            draw_sell_arrow(canvas, float(point["p1_x"]), float(point["p1_high_y"]) - 18, sell_color)
-        if trade_plan.buy_symbol == symbol_1:
-            draw_buy_arrow(canvas, float(point["p1_x"]), float(point["p1_low_y"]) + 18, buy_color, height)
-        if trade_plan.sell_symbol == symbol_2:
-            draw_sell_arrow(canvas, float(point["p2_x"]), float(point["p2_high_y"]) - 18, sell_color)
-        if trade_plan.buy_symbol == symbol_2:
-            draw_buy_arrow(canvas, float(point["p2_x"]), float(point["p2_low_y"]) + 18, buy_color, height)
+    if trade_plan.entry_ready:
+        for point in last_points:
+            if trade_plan.symbol_1_side == "sell":
+                draw_sell_arrow(canvas, float(point["p1_x"]), float(point["p1_high_y"]) - 18, sell_color)
+            elif trade_plan.symbol_1_side == "buy":
+                draw_buy_arrow(canvas, float(point["p1_x"]), float(point["p1_low_y"]) + 18, buy_color, height)
+            if trade_plan.symbol_2_side == "sell":
+                draw_sell_arrow(canvas, float(point["p2_x"]), float(point["p2_high_y"]) - 18, sell_color)
+            elif trade_plan.symbol_2_side == "buy":
+                draw_buy_arrow(canvas, float(point["p2_x"]), float(point["p2_low_y"]) + 18, buy_color, height)
 
     canvas.create_text(
         viewport_right - 16,

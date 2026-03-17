@@ -2,51 +2,57 @@ from __future__ import annotations
 
 from tkinter import messagebox
 
-from src.app.ui_relative_compare.services.trading import close_pair_positions, open_pair_positions, reverse_pair_positions
+from src.app.ui_relative_compare.services.market.hedge.direction import paired_side
+from src.app.ui_relative_compare.services.trading import close_pair_positions, open_pair_legs, reverse_pair_positions
 
 
 class ControllerTradeMixin:
-    def build_direct_order(self, symbol_index: int, side: str) -> tuple[str, str, float, float]:
+    def _current_side_relation(self) -> str:
+        if self.current_snapshot is not None:
+            return self.current_snapshot.trade_plan.side_relation
+        return "same" if bool(self.view.negative_correlation_var.get()) else "opposite"
+
+    def build_direct_order(self, symbol_index: int, side: str) -> list[tuple[str, str, float]]:
         symbol_1, symbol_2, _, _, _, _ = self.read_inputs()
         lot_1, lot_2 = self.resolve_pair_lots(strict=True)
+        side_relation = self._current_side_relation()
 
-        if symbol_index == 1 and side == "sell":
-            return symbol_1, symbol_2, lot_1, lot_2
-        if symbol_index == 1 and side == "buy":
-            return symbol_2, symbol_1, lot_2, lot_1
-        if symbol_index == 2 and side == "sell":
-            return symbol_2, symbol_1, lot_2, lot_1
-        if symbol_index == 2 and side == "buy":
-            return symbol_1, symbol_2, lot_1, lot_2
-        raise RuntimeError("Некорректная команда открытия")
+        if symbol_index == 1:
+            side_1 = side
+            side_2 = paired_side(side, side_relation)
+        elif symbol_index == 2:
+            side_2 = side
+            side_1 = paired_side(side, side_relation)
+        else:
+            raise RuntimeError("Некорректная команда открытия")
+
+        return [
+            (symbol_1, side_1, lot_1),
+            (symbol_2, side_2, lot_2),
+        ]
 
     def open_direct_order(self, symbol_index: int, side: str) -> None:
         try:
             self.ensure_connected()
             assert self.client is not None
 
-            sell_symbol, buy_symbol, sell_lots, buy_lots = self.build_direct_order(symbol_index, side)
-            result = open_pair_positions(
+            legs = self.build_direct_order(symbol_index, side)
+            result = open_pair_legs(
                 client=self.client,
                 cfg=self.base_cfg,
-                sell_symbol=sell_symbol,
-                buy_symbol=buy_symbol,
-                sell_lots=sell_lots,
-                buy_lots=buy_lots,
+                legs=legs,
             )
             self.view.status_var.set("orders_opened")
-            messagebox.showinfo(
-                "Позиции открыты",
-                f"SELL {sell_symbol} {result.sell_volume:.2f}\n"
-                f"BUY {buy_symbol} {result.buy_volume:.2f}\n"
-                f"sell_order={result.sell_order} retcode={result.sell_retcode}\n"
-                f"buy_order={result.buy_order} retcode={result.buy_retcode}",
+            opened_text = "\n".join(
+                f"{leg.side.upper()} {leg.symbol} {leg.volume:.2f} order={leg.order} retcode={leg.retcode}"
+                for leg in result.legs
             )
+            messagebox.showinfo("Позиции открыты", opened_text)
             if self.current_snapshot is not None:
                 self.render_once()
         except Exception as exc:
             self.view.status_var.set("order_error")
-            messagebox.showerror("Открытие противоположных позиций", str(exc))
+            messagebox.showerror("Открытие позиций по связке", str(exc))
 
     def close_current_pair_positions(self) -> None:
         try:

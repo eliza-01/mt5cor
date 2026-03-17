@@ -60,11 +60,23 @@ class ControllerRenderMixin:
             raise RuntimeError("Коэффициент 1/2 должен быть больше 0")
         return value
 
+    def read_signal_params(self) -> tuple[int, int, float, float]:
+        fast_window = max(1, int(str(self.view.signal_fast_ma_var.get()).strip() or "8"))
+        slow_window = max(fast_window + 1, int(str(self.view.signal_slow_ma_var.get()).strip() or "34"))
+        entry_threshold = abs(float(str(self.view.signal_entry_threshold_var.get()).strip().replace(",", ".") or "12.0"))
+        exit_threshold = abs(float(str(self.view.signal_exit_threshold_var.get()).strip().replace(",", ".") or "3.0"))
+        return fast_window, slow_window, entry_threshold, exit_threshold
+
     def resolve_pair_lots(self, strict: bool = True) -> tuple[float, float]:
         symbol_1 = self.view.symbol_1_var.get().strip() or "EURUSD"
         symbol_2 = self.view.symbol_2_var.get().strip() or "AUDUSD"
 
         if self.view.auto_volume_var.get():
+            if self.current_snapshot is not None:
+                return (
+                    float(self.current_snapshot.trade_plan.symbol_1_lots),
+                    float(self.current_snapshot.trade_plan.symbol_2_lots),
+                )
             ratio_1_to_2 = self.read_manual_ratio()
             return float(self.base_cfg.base_lot_eurusd), float(self.base_cfg.base_lot_eurusd * ratio_1_to_2)
 
@@ -84,7 +96,8 @@ class ControllerRenderMixin:
             assert self.client is not None
 
             symbol_1, symbol_2, timeframe, visible_bars, _, aggregate_bars = self.read_inputs()
-            ratio_1_to_2 = self.read_manual_ratio()
+            manual_ratio_1_to_2 = self.read_manual_ratio()
+            fast_window, slow_window, entry_threshold, exit_threshold = self.read_signal_params()
             invert_second = bool(self.view.negative_correlation_var.get())
 
             prev_x = self.view.candle_canvas.xview()[0]
@@ -97,8 +110,13 @@ class ControllerRenderMixin:
                 symbol_2=symbol_2,
                 timeframe=timeframe,
                 bars_count=visible_bars,
-                ratio_1_to_2=ratio_1_to_2,
+                ratio_1_to_2=manual_ratio_1_to_2,
                 bars_per_candle=aggregate_bars,
+                mutual_exclusion_enabled=bool(self.view.mutual_exclusion_var.get()),
+                signal_fast_window=fast_window,
+                signal_slow_window=slow_window,
+                signal_entry_threshold=entry_threshold,
+                signal_exit_threshold=exit_threshold,
                 invert_second=invert_second,
             )
             self.current_snapshot = snapshot
@@ -126,6 +144,8 @@ class ControllerRenderMixin:
                 digits_1=snapshot.digits_1,
                 digits_2=snapshot.digits_2,
                 mutual_exclusion_enabled=bool(self.view.mutual_exclusion_var.get()),
+                signal_diagnostics=snapshot.signal_diagnostics,
+                line_chart_mode=self.view.line_chart_mode_var.get().strip() or "gap_ma",
             )
 
             self.view.update_idletasks()
@@ -161,6 +181,8 @@ class ControllerRenderMixin:
             digits_1=self.current_snapshot.digits_1,
             digits_2=self.current_snapshot.digits_2,
             mutual_exclusion_enabled=bool(self.view.mutual_exclusion_var.get()),
+            signal_diagnostics=self.current_snapshot.signal_diagnostics,
+            line_chart_mode=self.view.line_chart_mode_var.get().strip() or "gap_ma",
         )
 
         self.view.update_idletasks()
@@ -176,14 +198,22 @@ class ControllerRenderMixin:
 
         mode_text = "AUTO" if self.view.auto_volume_var.get() else "MANUAL"
         try:
-            ratio_1_to_2 = self.read_manual_ratio()
             lot_1, lot_2 = self.resolve_pair_lots(strict=not self.view.auto_volume_var.get())
+            hedge = snapshot.hedge_diagnostics
+            signal = snapshot.signal_diagnostics
+            state_text = "ENTER" if signal.entry_ready else ("EXIT" if signal.exit_ready else "WAIT")
+            if snapshot.trade_plan.entry_ready:
+                legs_text = (
+                    f"{snapshot.trade_plan.symbol_1_side.upper()} {snapshot.trade_plan.symbol_1} {lot_1:.2f} | "
+                    f"{snapshot.trade_plan.symbol_2_side.upper()} {snapshot.trade_plan.symbol_2} {lot_2:.2f}"
+                )
+            else:
+                legs_text = "входа нет"
             self.view.trade_hint_var.set(
-                f"{mode_text} | coef 1/2 {ratio_1_to_2:.6f} | "
-                f"{snapshot.trade_plan.symbol_1} {lot_1:.2f} | {snapshot.trade_plan.symbol_2} {lot_2:.2f} | "
-                f"лидер {snapshot.trade_plan.leader_symbol} {snapshot.trade_plan.leader_move:.2f} | "
-                f"ведомая {snapshot.trade_plan.follower_symbol} {snapshot.trade_plan.follower_move:.2f} | "
-                f"подсказка SELL {snapshot.trade_plan.sell_symbol} / BUY {snapshot.trade_plan.buy_symbol}"
+                f"{mode_text} | {state_text} | gap={signal.gap_last:+.2f} | "
+                f"fast={signal.fast_last:+.2f} slow={signal.slow_last:+.2f} | "
+                f"diff={signal.ma_diff_last:+.2f} | entry={signal.entry_threshold:.2f} exit={signal.exit_threshold:.2f} | "
+                f"q={hedge.execution_ratio:+.4f} relation={hedge.side_relation} | {legs_text}"
             )
         except Exception as exc:
             self.view.trade_hint_var.set(f"{mode_text} | ошибка параметров: {exc}")

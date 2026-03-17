@@ -3,7 +3,7 @@ from __future__ import annotations
 from src.broker.mt5_client import MT5Client
 from src.common.settings import Settings
 from .history import sum_deals, wait_closed_position_deals
-from .models import ClosePairSummary, OrderSendSummary, ReopenedLeg, ReversePairSummary
+from .models import ClosePairSummary, OrderLegSummary, OrderSendSummary, ReopenedLeg, ReversePairSummary
 from .positions import build_reverse_legs_from_positions, symbol_positions
 from .requests import close_position_with_fill_fallback, send_market_with_fill_fallback
 from .terminal import ensure_python_trading_enabled
@@ -17,18 +17,52 @@ def _open_leg(client: MT5Client, cfg: Settings, symbol: str, side: str, volume: 
     return ReopenedLeg(symbol=symbol, side=side, volume=normalized_volume, retcode=int(result.retcode), order=int(getattr(result, "order", 0) or 0))
 
 
-def open_pair_positions(client: MT5Client, cfg: Settings, sell_symbol: str, buy_symbol: str, sell_lots: float, buy_lots: float, deviation: int = 20) -> OrderSendSummary:
+def open_pair_legs(client: MT5Client, cfg: Settings, legs: list[tuple[str, str, float]], deviation: int = 20) -> OrderSendSummary:
     ensure_python_trading_enabled()
-    client.ensure_symbol(sell_symbol)
-    client.ensure_symbol(buy_symbol)
+    opened: list[OrderLegSummary] = []
+    errors: list[str] = []
 
-    normalized_sell_lots = normalize_volume(sell_lots, sell_symbol)
-    normalized_buy_lots = normalize_volume(buy_lots, buy_symbol)
+    for symbol, side, volume in legs:
+        try:
+            client.ensure_symbol(symbol)
+            normalized_volume = normalize_volume(volume, symbol)
+            result = send_market_with_fill_fallback(symbol=symbol, volume=normalized_volume, side=side, deviation=deviation, magic=cfg.mt5_magic, comment="relative_compare_open")
+            opened.append(
+                OrderLegSummary(
+                    symbol=symbol,
+                    side=side,
+                    volume=normalized_volume,
+                    retcode=int(result.retcode),
+                    order=int(getattr(result, "order", 0) or 0),
+                )
+            )
+        except Exception as exc:
+            errors.append(f"{side.upper()} {symbol} {volume:.2f}: {exc}")
 
-    sell_result = send_market_with_fill_fallback(symbol=sell_symbol, volume=normalized_sell_lots, side="sell", deviation=deviation, magic=cfg.mt5_magic, comment="relative_compare_sell")
-    buy_result = send_market_with_fill_fallback(symbol=buy_symbol, volume=normalized_buy_lots, side="buy", deviation=deviation, magic=cfg.mt5_magic, comment="relative_compare_buy")
+    if errors:
+        opened_text = "\n".join(
+            f"{leg.side.upper()} {leg.symbol} {leg.volume:.2f} order={leg.order} retcode={leg.retcode}"
+            for leg in opened
+        )
+        parts = ["Не все ноги открылись."]
+        if opened_text:
+            parts.extend(["Уже открыто:", opened_text])
+        parts.extend(["Ошибки:", "\n".join(errors)])
+        raise RuntimeError("\n".join(parts))
 
-    return OrderSendSummary(sell_retcode=int(sell_result.retcode), buy_retcode=int(buy_result.retcode), sell_order=int(getattr(sell_result, "order", 0) or 0), buy_order=int(getattr(buy_result, "order", 0) or 0), sell_volume=normalized_sell_lots, buy_volume=normalized_buy_lots)
+    return OrderSendSummary(legs=opened)
+
+
+def open_pair_positions(client: MT5Client, cfg: Settings, sell_symbol: str, buy_symbol: str, sell_lots: float, buy_lots: float, deviation: int = 20) -> OrderSendSummary:
+    return open_pair_legs(
+        client=client,
+        cfg=cfg,
+        legs=[
+            (sell_symbol, "sell", sell_lots),
+            (buy_symbol, "buy", buy_lots),
+        ],
+        deviation=deviation,
+    )
 
 
 def close_pair_positions(client: MT5Client, cfg: Settings, symbol_1: str, symbol_2: str, deviation: int = 20) -> ClosePairSummary:

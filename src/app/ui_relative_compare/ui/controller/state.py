@@ -22,6 +22,11 @@ class ControllerStateMixin:
             self.view.auto_volume_var,
             self.view.manual_lot_1_var,
             self.view.manual_lot_2_var,
+            self.view.signal_fast_ma_var,
+            self.view.signal_slow_ma_var,
+            self.view.signal_entry_threshold_var,
+            self.view.signal_exit_threshold_var,
+            self.view.line_chart_mode_var,
             self.view.line_zoom_var,
         ]
         for var in tracked:
@@ -32,6 +37,10 @@ class ControllerStateMixin:
         self.view.manual_lot_1_var.trace_add("write", self.on_manual_volume_changed)
         self.view.manual_lot_2_var.trace_add("write", self.on_manual_volume_changed)
         self.view.manual_ratio_1_to_2_var.trace_add("write", self.on_manual_ratio_changed)
+        self.view.signal_fast_ma_var.trace_add("write", self.on_signal_param_changed)
+        self.view.signal_slow_ma_var.trace_add("write", self.on_signal_param_changed)
+        self.view.signal_entry_threshold_var.trace_add("write", self.on_signal_param_changed)
+        self.view.signal_exit_threshold_var.trace_add("write", self.on_signal_param_changed)
 
         self.view.bind("<Configure>", self.on_window_configure)
         self.view.chart_panes.bind("<ButtonRelease-1>", self.on_chart_panes_release)
@@ -71,6 +80,11 @@ class ControllerStateMixin:
             auto_volume=bool(self.view.auto_volume_var.get()),
             manual_lot_1=self.view.manual_lot_1_var.get().strip() or "0.10",
             manual_lot_2=self.view.manual_lot_2_var.get().strip() or "0.10",
+            signal_fast_ma=self.view.signal_fast_ma_var.get().strip() or "8",
+            signal_slow_ma=self.view.signal_slow_ma_var.get().strip() or "34",
+            signal_entry_threshold=self.view.signal_entry_threshold_var.get().strip() or "12.0",
+            signal_exit_threshold=self.view.signal_exit_threshold_var.get().strip() or "3.0",
+            line_chart_mode=self.view.line_chart_mode_var.get().strip() or "gap_ma",
             width_adjust_px=int(self.view.width_adjust_px),
             height_adjust_px=int(self.view.height_adjust_px),
             pair_gap_adjust_px=int(self.view.pair_gap_adjust_px),
@@ -139,6 +153,13 @@ class ControllerStateMixin:
 
     def on_manual_ratio_changed(self, *_args) -> None:
         self.update_trade_hint()
+
+    def on_signal_param_changed(self, *_args) -> None:
+        self.update_trade_hint()
+
+    def on_line_chart_mode_changed(self) -> None:
+        if self.current_snapshot is not None:
+            self.redraw_current_snapshot()
 
     def update_manual_volume_state(self) -> None:
         state = "disabled" if self.view.auto_volume_var.get() else "normal"

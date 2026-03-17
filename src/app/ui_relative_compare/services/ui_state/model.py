@@ -17,6 +17,11 @@ class UIState:
     auto_volume: bool = True
     manual_lot_1: str = "0.10"
     manual_lot_2: str = "0.10"
+    signal_fast_ma: str = "8"
+    signal_slow_ma: str = "34"
+    signal_entry_threshold: str = "12.0"
+    signal_exit_threshold: str = "3.0"
+    line_chart_mode: str = "gap_ma"
     width_adjust_px: int = 0
     height_adjust_px: int = 0
     pair_gap_adjust_px: int = 0

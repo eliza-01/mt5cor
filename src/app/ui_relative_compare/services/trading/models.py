@@ -4,13 +4,17 @@ from dataclasses import dataclass
 
 
 @dataclass(slots=True)
+class OrderLegSummary:
+    symbol: str
+    side: str
+    volume: float
+    retcode: int
+    order: int
+
+
+@dataclass(slots=True)
 class OrderSendSummary:
-    sell_retcode: int
-    buy_retcode: int
-    sell_order: int
-    buy_order: int
-    sell_volume: float
-    buy_volume: float
+    legs: list[OrderLegSummary]
 
 
 @dataclass(slots=True)

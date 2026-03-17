@@ -34,6 +34,12 @@ class RelativeCompareWindow(tk.Tk):
         self.auto_volume_var = tk.BooleanVar(value=saved_state.auto_volume)
         self.manual_lot_1_var = tk.StringVar(value=saved_state.manual_lot_1)
         self.manual_lot_2_var = tk.StringVar(value=saved_state.manual_lot_2)
+        self.signal_fast_ma_var = tk.StringVar(value=saved_state.signal_fast_ma)
+        self.signal_slow_ma_var = tk.StringVar(value=saved_state.signal_slow_ma)
+        self.signal_entry_threshold_var = tk.StringVar(value=saved_state.signal_entry_threshold)
+        self.signal_exit_threshold_var = tk.StringVar(value=saved_state.signal_exit_threshold)
+        self.line_chart_mode_var = tk.StringVar(value=saved_state.line_chart_mode or "gap_ma")
+
         self.manual_lot_1_label_var = tk.StringVar(value="Lot EURUSD")
         self.manual_lot_2_label_var = tk.StringVar(value="Lot AUDUSD")
         self.header_symbol_1_var = tk.StringVar(value="EURO")
@@ -94,7 +100,22 @@ class RelativeCompareWindow(tk.Tk):
     def make_action_button(self, parent: tk.Widget, text: str, command, bg_color: str, width_px: int, height_px: int = 28, store_key: str | None = None) -> tk.Frame:
         frame = tk.Frame(parent, width=width_px, height=height_px, bg=ACTION_BG, highlightthickness=0, bd=0)
         frame.pack_propagate(False)
-        button = tk.Button(frame, text=text, command=command, bg=bg_color, fg="#ffffff", activebackground=bg_color, activeforeground="#ffffff", highlightthickness=0, relief="flat", bd=0, font=("Segoe UI", 8, "bold"), cursor="hand2", padx=0, pady=0)
+        button = tk.Button(
+            frame,
+            text=text,
+            command=command,
+            bg=bg_color,
+            fg="#ffffff",
+            activebackground=bg_color,
+            activeforeground="#ffffff",
+            highlightthickness=0,
+            relief="flat",
+            bd=0,
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2",
+            padx=0,
+            pady=0,
+        )
         button.pack(fill="both", expand=True)
         if store_key:
             self.action_button_widgets[store_key] = button
@@ -103,17 +124,56 @@ class RelativeCompareWindow(tk.Tk):
     def make_chart_panel_header(self, parent: tk.Widget, title: str, indicator_var: tk.StringVar, command) -> tk.Frame:
         header = tk.Frame(parent, bg=PANE_HEADER_BG, height=32, highlightthickness=1, highlightbackground=PANE_BORDER, bd=0)
         header.pack_propagate(False)
-        toggle = tk.Button(header, textvariable=indicator_var, command=command, bg=PANE_HEADER_BG, fg=ACTION_TEXT, activebackground=PANE_HEADER_BG, activeforeground="#ffffff", highlightthickness=0, relief="flat", bd=0, font=("Segoe UI", 10, "bold"), width=2, cursor="hand2", padx=0, pady=0)
+        toggle = tk.Button(
+            header,
+            textvariable=indicator_var,
+            command=command,
+            bg=PANE_HEADER_BG,
+            fg=ACTION_TEXT,
+            activebackground=PANE_HEADER_BG,
+            activeforeground="#ffffff",
+            highlightthickness=0,
+            relief="flat",
+            bd=0,
+            font=("Segoe UI", 10, "bold"),
+            width=2,
+            cursor="hand2",
+            padx=0,
+            pady=0,
+        )
         toggle.pack(side="left", padx=(6, 4), pady=2)
         tk.Label(header, text=title, bg=PANE_HEADER_BG, fg=ACTION_TEXT, font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 6))
         return header
 
     def make_paned_window(self, parent: tk.Widget) -> tk.PanedWindow:
-        cfg_full = dict(orient="vertical", sashwidth=12, sashpad=2, bg=PANE_BORDER, bd=0, relief="flat", opaqueresize=True, sashrelief="raised", sashcursor="sb_v_double_arrow", showhandle=True, handlesize=10, handlepad=0)
+        cfg_full = dict(
+            orient="vertical",
+            sashwidth=12,
+            sashpad=2,
+            bg=PANE_BORDER,
+            bd=0,
+            relief="flat",
+            opaqueresize=True,
+            sashrelief="raised",
+            sashcursor="sb_v_double_arrow",
+            showhandle=True,
+            handlesize=10,
+            handlepad=0,
+        )
         try:
             return tk.PanedWindow(parent, **cfg_full)
         except tk.TclError:
-            cfg_safe = dict(orient="vertical", sashwidth=12, sashpad=2, bg=PANE_BORDER, bd=0, relief="flat", opaqueresize=True, sashrelief="raised", sashcursor="sb_v_double_arrow")
+            cfg_safe = dict(
+                orient="vertical",
+                sashwidth=12,
+                sashpad=2,
+                bg=PANE_BORDER,
+                bd=0,
+                relief="flat",
+                opaqueresize=True,
+                sashrelief="raised",
+                sashcursor="sb_v_double_arrow",
+            )
             return tk.PanedWindow(parent, **cfg_safe)
 
     def set_panel_body_visible(self, panel_body: tk.Frame, visible: bool) -> None:
