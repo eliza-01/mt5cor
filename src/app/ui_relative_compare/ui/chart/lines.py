@@ -14,15 +14,18 @@ SLOW_COLOR = "#f59e0b"
 DIFF_COLOR = "#22c55e"
 
 
-def _format_value(value: float) -> str:
-    return f"{float(value):+.2f}".rstrip("0").rstrip(".")
-
-
 def _normalize(series: pd.Series) -> pd.Series:
     return pd.Series(series, dtype=float).reset_index(drop=True)
 
 
-def _extend_points(series: pd.Series, mid_y: float, scale: float, n: int, width_adjust_px: int, pair_gap_adjust_px: int) -> tuple[list[float], float, float]:
+def _extend_points(
+    series: pd.Series,
+    mid_y: float,
+    scale: float,
+    n: int,
+    width_adjust_px: int,
+    pair_gap_adjust_px: int,
+) -> tuple[list[float], float, float]:
     layout = pair_layout(width_adjust_px, pair_gap_adjust_px)
     points: list[float] = []
     last_center_x = 0.0
@@ -63,6 +66,7 @@ def render_relative_lines(
     entry_threshold: float,
     exit_threshold: float,
     chart_mode: str,
+    aggregate_progress_text: str | None,
 ) -> None:
     canvas.update_idletasks()
     viewport_width = max(canvas.winfo_width(), 400)
@@ -123,36 +127,14 @@ def render_relative_lines(
         canvas.create_line(LEFT_PAD, exit_y_top, total_width - RIGHT_PAD, exit_y_top, fill="#1f2937", dash=(2, 3))
         canvas.create_line(LEFT_PAD, exit_y_bottom, total_width - RIGHT_PAD, exit_y_bottom, fill="#1f2937", dash=(2, 3))
 
-    gap_points, last_center_x, last_gap_y = _extend_points(plot_gap, mid_y, scale, n, width_adjust_px, pair_gap_adjust_px)
-
+    gap_points, _, _ = _extend_points(plot_gap, mid_y, scale, n, width_adjust_px, pair_gap_adjust_px)
     if len(gap_points) >= 4:
         canvas.create_line(*gap_points, fill=GAP_COLOR, width=1, smooth=False)
 
     if mode == "gap_diff":
-        diff_points, _, last_diff_y = _extend_points(plot_diff, mid_y, scale, n, width_adjust_px, pair_gap_adjust_px)
+        diff_points, _, _ = _extend_points(plot_diff, mid_y, scale, n, width_adjust_px, pair_gap_adjust_px)
         if len(diff_points) >= 4:
             canvas.create_line(*diff_points, fill=DIFF_COLOR, width=2, smooth=False)
-
-        if n > 0 and not plot_diff.empty:
-            diff_value = float(plot_diff.iloc[-1])
-            top_y = min(last_gap_y, last_diff_y)
-            canvas.create_text(
-                last_center_x,
-                max(12.0, top_y - 10.0),
-                anchor="s",
-                text=f"diff {_format_value(diff_value)}",
-                fill=CHART_TEXT,
-                font=("Segoe UI", 10, "bold"),
-            )
-
-        canvas.create_text(
-            viewport_left + 10,
-            8,
-            anchor="nw",
-            fill=CHART_TEXT,
-            font=("Segoe UI", 9),
-            text=f"mode: gap + diff | gap(gray) | diff(green) | entry={entry_threshold:.2f} exit={exit_threshold:.2f}",
-        )
 
         draw_selection_on_line(
             canvas=canvas,
@@ -168,35 +150,13 @@ def render_relative_lines(
             selected_end_index=selected_end_index,
         )
     else:
-        fast_points, _, last_fast_y = _extend_points(plot_fast, mid_y, scale, n, width_adjust_px, pair_gap_adjust_px)
-        slow_points, _, last_slow_y = _extend_points(plot_slow, mid_y, scale, n, width_adjust_px, pair_gap_adjust_px)
+        fast_points, _, _ = _extend_points(plot_fast, mid_y, scale, n, width_adjust_px, pair_gap_adjust_px)
+        slow_points, _, _ = _extend_points(plot_slow, mid_y, scale, n, width_adjust_px, pair_gap_adjust_px)
 
         if len(fast_points) >= 4:
             canvas.create_line(*fast_points, fill=FAST_COLOR, width=2, smooth=False)
         if len(slow_points) >= 4:
             canvas.create_line(*slow_points, fill=SLOW_COLOR, width=2, smooth=False)
-
-        if n > 0 and not fast_ma.empty and not slow_ma.empty and not gap.empty:
-            diff_value = float(fast_ma.iloc[-1] - slow_ma.iloc[-1])
-            gap_value = float(gap.iloc[-1])
-            top_y = min(last_gap_y, last_fast_y, last_slow_y)
-            canvas.create_text(
-                last_center_x,
-                max(12.0, top_y - 10.0),
-                anchor="s",
-                text=f"gap {_format_value(gap_value)} | diff {_format_value(diff_value)}",
-                fill=CHART_TEXT,
-                font=("Segoe UI", 10, "bold"),
-            )
-
-        canvas.create_text(
-            viewport_left + 10,
-            8,
-            anchor="nw",
-            fill=CHART_TEXT,
-            font=("Segoe UI", 9),
-            text="mode: centered gap + fast + slow | общий дрейф убран | gap(gray) | fast(green) | slow(orange)",
-        )
 
         draw_selection_on_line(
             canvas=canvas,
@@ -210,6 +170,17 @@ def render_relative_lines(
             height=height,
             selected_start_index=selected_start_index,
             selected_end_index=selected_end_index,
+        )
+
+    if aggregate_progress_text and aggregate_progress_text != "1/1" and n > 0:
+        _, _, last_center_x = pair_positions(n - 1, LEFT_PAD, layout.body_half, layout.pair_gap, layout.pair_width)
+        canvas.create_text(
+            last_center_x,
+            height - 10,
+            anchor="s",
+            fill=CHART_TEXT,
+            font=("Segoe UI", 9),
+            text=aggregate_progress_text,
         )
 
     canvas.configure(scrollregion=(0, 0, total_width, height))

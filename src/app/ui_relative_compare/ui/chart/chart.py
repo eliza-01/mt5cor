@@ -37,6 +37,10 @@ class RelativeChart:
         signal_diagnostics: SignalDiagnostics,
         line_chart_mode: str,
     ) -> None:
+        aggregate_progress_text = None
+        if not bars.empty and "agg_progress" in bars.columns:
+            aggregate_progress_text = str(bars.iloc[-1]["agg_progress"])
+
         render_candles(
             canvas=self.candle_canvas,
             bars=bars,
@@ -51,7 +55,9 @@ class RelativeChart:
             selected_start_index=selected_start_index,
             selected_end_index=selected_end_index,
             colors=colors,
+            aggregate_progress_text=aggregate_progress_text,
         )
+
         gap, fast_ma, slow_ma = build_signal_line_series(
             bars,
             digits_1=digits_1,
@@ -62,6 +68,7 @@ class RelativeChart:
             fast_window=signal_diagnostics.fast_window,
             slow_window=signal_diagnostics.slow_window,
         )
+
         render_relative_lines(
             canvas=self.line_canvas,
             gap=gap,
@@ -76,6 +83,7 @@ class RelativeChart:
             entry_threshold=signal_diagnostics.entry_threshold,
             exit_threshold=signal_diagnostics.exit_threshold,
             chart_mode=line_chart_mode,
+            aggregate_progress_text=aggregate_progress_text,
         )
 
     def get_index_at_x(self, bars_count: int, x_world: float, width_adjust_px: int, pair_gap_adjust_px: int) -> int | None:

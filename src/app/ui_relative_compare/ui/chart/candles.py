@@ -24,6 +24,7 @@ def render_candles(
     selected_start_index: int | None,
     selected_end_index: int | None,
     colors: dict[str, str],
+    aggregate_progress_text: str | None,
 ) -> None:
     canvas.update_idletasks()
     viewport_width = max(canvas.winfo_width(), 400)
@@ -124,10 +125,22 @@ def render_candles(
                 draw_sell_arrow(canvas, float(point["p1_x"]), float(point["p1_high_y"]) - 18, sell_color)
             elif trade_plan.symbol_1_side == "buy":
                 draw_buy_arrow(canvas, float(point["p1_x"]), float(point["p1_low_y"]) + 18, buy_color, height)
+
             if trade_plan.symbol_2_side == "sell":
                 draw_sell_arrow(canvas, float(point["p2_x"]), float(point["p2_high_y"]) - 18, sell_color)
             elif trade_plan.symbol_2_side == "buy":
                 draw_buy_arrow(canvas, float(point["p2_x"]), float(point["p2_low_y"]) + 18, buy_color, height)
+
+    if aggregate_progress_text and aggregate_progress_text != "1/1" and n > 0:
+        _, _, last_center_x = pair_positions(n - 1, LEFT_PAD, layout.body_half, layout.pair_gap, layout.pair_width)
+        canvas.create_text(
+            last_center_x,
+            height - 12,
+            anchor="s",
+            fill=CHART_TEXT,
+            font=("Segoe UI", 9),
+            text=aggregate_progress_text,
+        )
 
     canvas.create_text(
         viewport_right - 16,

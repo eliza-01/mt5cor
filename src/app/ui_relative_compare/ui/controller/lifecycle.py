@@ -15,7 +15,7 @@ class ControllerLifecycleMixin:
 
     def live_tick(self) -> None:
         try:
-            self.render_once()
+            self.render_once(from_live=True)
         except Exception:
             pass
         finally:

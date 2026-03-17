@@ -62,20 +62,22 @@ def build_relative_bars(
     out["p1_body_abs"] = out["p1_close"].abs()
     out["p2_body_abs"] = out["p2_close"].abs()
 
-    return out[
-        [
-            "time",
-            "open_1",
-            "close_1",
-            "open_2",
-            "close_2",
-            "p1_high",
-            "p1_low",
-            "p1_close",
-            "p2_high",
-            "p2_low",
-            "p2_close",
-            "p1_body_abs",
-            "p2_body_abs",
-        ]
-    ].reset_index(drop=True)
+    base_columns = [
+        "time",
+        "open_1",
+        "close_1",
+        "open_2",
+        "close_2",
+        "p1_high",
+        "p1_low",
+        "p1_close",
+        "p2_high",
+        "p2_low",
+        "p2_close",
+        "p1_body_abs",
+        "p2_body_abs",
+    ]
+    if "agg_progress" in out.columns:
+        base_columns.append("agg_progress")
+
+    return out[base_columns].reset_index(drop=True)

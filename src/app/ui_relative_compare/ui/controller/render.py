@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pandas as pd
 from tkinter import messagebox
 
 from src.app.ui_relative_compare.constants import TIMEFRAME_MINUTES
@@ -90,7 +91,42 @@ class ControllerRenderMixin:
                 raise
             return 0.0, 0.0
 
-    def render_once(self) -> None:
+    def _latest_common_bar_time(self, symbol_1: str, symbol_2: str, timeframe: str):
+        assert self.client is not None
+        frame_1 = self.client.copy_rates(symbol_1, timeframe, 3)[["time"]].copy()
+        frame_2 = self.client.copy_rates(symbol_2, timeframe, 3)[["time"]].copy()
+        merged = pd.merge(frame_1, frame_2, on="time", how="inner")
+        if merged.empty:
+            return None
+        return merged.iloc[-1]["time"]
+
+    def _count_new_bars(self, previous_time, latest_time, timeframe: str) -> int:
+        if previous_time is None or latest_time is None:
+            return 0
+
+        prev_ts = pd.Timestamp(previous_time)
+        latest_ts = pd.Timestamp(latest_time)
+        if latest_ts <= prev_ts:
+            return 0
+
+        tf_minutes = TIMEFRAME_MINUTES[timeframe]
+        delta = latest_ts - prev_ts
+        bars = int(delta / pd.Timedelta(minutes=tf_minutes))
+        return max(1, bars)
+
+    def _restore_scroll_after_redraw(self, prev_left: float, prev_right: float, had_snapshot: bool) -> None:
+        if not had_snapshot:
+            self.sync_canvas_view(1.0)
+            return
+        if prev_left <= 0.001:
+            self.sync_canvas_view(0.0)
+            return
+        if prev_right >= 0.999:
+            self.sync_canvas_view(1.0)
+            return
+        self.sync_canvas_view(prev_left)
+
+    def render_once(self, from_live: bool = False) -> None:
         try:
             self.ensure_connected()
             assert self.client is not None
@@ -100,8 +136,23 @@ class ControllerRenderMixin:
             fast_window, slow_window, entry_threshold, exit_threshold = self.read_signal_params()
             invert_second = bool(self.view.negative_correlation_var.get())
 
-            prev_x = self.view.candle_canvas.xview()[0]
+            prev_left, prev_right = self.view.candle_canvas.xview()
             had_snapshot = self.current_snapshot is not None
+
+            requested_changed = self.live_base_visible_bars != visible_bars
+            full_reset = (not from_live) or (self.current_snapshot is None) or requested_changed
+
+            if full_reset:
+                self.live_base_visible_bars = visible_bars
+                self.live_effective_bars = visible_bars
+            else:
+                latest_common_time = self._latest_common_bar_time(symbol_1, symbol_2, timeframe)
+                new_bars = self._count_new_bars(self.live_last_bar_time, latest_common_time, timeframe)
+                if new_bars <= 0:
+                    return
+                self.live_effective_bars = int(self.live_effective_bars or visible_bars) + new_bars
+
+            effective_bars_count = int(self.live_effective_bars or visible_bars)
 
             snapshot = build_render_snapshot(
                 client=self.client,
@@ -109,7 +160,7 @@ class ControllerRenderMixin:
                 symbol_1=symbol_1,
                 symbol_2=symbol_2,
                 timeframe=timeframe,
-                bars_count=visible_bars,
+                bars_count=effective_bars_count,
                 ratio_1_to_2=manual_ratio_1_to_2,
                 bars_per_candle=aggregate_bars,
                 mutual_exclusion_enabled=bool(self.view.mutual_exclusion_var.get()),
@@ -122,6 +173,8 @@ class ControllerRenderMixin:
             self.current_snapshot = snapshot
             if snapshot.bars.empty:
                 return
+
+            self.live_last_bar_time = snapshot.bars.iloc[-1]["time"]
 
             self.selection.resolve_indices(snapshot.bars)
             self.view.aggregate_info_var.set(f"{timeframe} x {aggregate_bars} | {len(snapshot.bars)} свечей")
@@ -149,19 +202,21 @@ class ControllerRenderMixin:
             )
 
             self.view.update_idletasks()
-            self.sync_canvas_view(prev_x if had_snapshot else 1.0)
-            self.view.status_var.set("rendered")
+            self._restore_scroll_after_redraw(prev_left, prev_right, had_snapshot)
+            self.view.status_var.set("live" if from_live else "rendered")
             self.update_trade_hint()
             self.update_selection_stats()
             self.schedule_state_save()
         except Exception as exc:
-            self.view.status_var.set("render_error")
-            messagebox.showerror("Рендер", str(exc))
+            self.view.status_var.set("live_error" if from_live else "render_error")
+            if not from_live:
+                messagebox.showerror("Рендер", str(exc))
 
     def redraw_current_snapshot(self) -> None:
         if self.current_snapshot is None or self.current_snapshot.bars.empty:
             return
-        prev_x = self.view.candle_canvas.xview()[0]
+
+        prev_left, prev_right = self.view.candle_canvas.xview()
         self.selection.resolve_indices(self.current_snapshot.bars)
 
         self.chart.draw(
@@ -186,7 +241,7 @@ class ControllerRenderMixin:
         )
 
         self.view.update_idletasks()
-        self.sync_canvas_view(prev_x)
+        self._restore_scroll_after_redraw(prev_left, prev_right, had_snapshot=True)
         self.update_trade_hint()
         self.update_selection_stats()
 

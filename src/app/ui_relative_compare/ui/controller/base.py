@@ -33,6 +33,10 @@ class RelativeCompareController(
         self.current_snapshot: RenderSnapshot | None = None
         self.selection = SelectionState()
 
+        self.live_last_bar_time = None
+        self.live_base_visible_bars: int | None = None
+        self.live_effective_bars: int | None = None
+
         self.drag_start_x = 0
         self.drag_active = False
         self.chart = RelativeChart(self.view.candle_canvas, self.view.line_canvas)
